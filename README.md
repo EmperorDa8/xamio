@@ -81,8 +81,8 @@ Drop in your timetable — PDF, image, spreadsheet, Word doc, whatever — and X
 ### 1. Clone
 
 ```bash
-git clone https://github.com/<your-username>/xamify.git
-cd xamify
+git clone https://github.com/<your-username>/xamio.git
+cd xamio
 ```
 
 ### 2. Backend
