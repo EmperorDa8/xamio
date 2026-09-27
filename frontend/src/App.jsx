@@ -7,6 +7,7 @@ import CalendarSync from "./components/CalendarSync";
 import PublicSite from "./components/PublicSite";
 import Dashboard from "./components/Dashboard";
 import ChangeSummary from "./components/ChangeSummary";
+import SiteNav, { Brand, SiteFooter } from "./components/SiteNav";
 import { useAuth } from "./auth/AuthProvider";
 import { logEvent } from "./lib/analytics";
 import {
@@ -18,8 +19,32 @@ import {
 } from "./lib/schedules";
 
 const API = import.meta.env.VITE_API_URL || "/api";
-const STEPS = ["Upload", "Review", "Alerts", "Sync"];
-const ROMAN = ["I", "II", "III", "IV"];
+// Same names and colours as the "How it works" cards on the landing page, so
+// the app picks up exactly where the pitch left off.
+const STEPS = [
+  { label: "Upload", hint: "Timetable + courses", tone: "pink" },
+  { label: "Review", hint: "Check what we found", tone: "peach" },
+  { label: "Alerts", hint: "When to nudge you", tone: "lavender" },
+  { label: "Sync", hint: "Calendar + email", tone: "mint" },
+];
+const PAGE_HEADS = [
+  {
+    title: <>Let's find your <em>exams</em>.</>,
+    sub: "Add the courses you're registered for, then drop the timetable exactly as your faculty sent it.",
+  },
+  {
+    title: <>Check what we <em>found</em>.</>,
+    sub: "Click any cell to fix it. Untick anything you don't want on your calendar.",
+  },
+  {
+    title: <>When should we <em>nudge</em> you?</>,
+    sub: "Smart reminders pick the timing from what each item is. Or set one schedule for everything.",
+  },
+  {
+    title: <>Put it on your <em>calendar</em>.</>,
+    sub: "Google Calendar, any other calendar app, and email reminders. Use one or all three.",
+  },
+];
 
 export default function App() {
   const { user, loading: authLoading, signOut } = useAuth();
@@ -31,6 +56,10 @@ export default function App() {
   const [registeredCourses, setRegisteredCourses] = useState([]);
   const [unmatchedCourses, setUnmatchedCourses] = useState([]);
   const [reminders, setReminders] = useState([1440, 180]);
+  // "smart" derives each item's reminders from its type; "custom" applies the
+  // picks above to everything. Smart by default — the students who miss
+  // deadlines are exactly the ones who never open a settings screen.
+  const [reminderMode, setReminderMode] = useState("smart");
   const [synced, setSynced] = useState(false);
   const [modelUsed, setModelUsed] = useState(null);
   const [dateWarnings, setDateWarnings] = useState([]);
@@ -233,60 +262,46 @@ export default function App() {
   if (authLoading) {
     return (
       <div className="auth-wrap">
-        <div className="auth-loading"><span className="pulse" /> Loading…</div>
+        <div className="x-ambient" aria-hidden="true" />
+        <div className="auth-loading"><span className="x-pulse" /> Loading your schedule…</div>
       </div>
     );
   }
   if (!user) return <PublicSite />;
 
+  const head = PAGE_HEADS[step];
+  const initial = (user.user_metadata?.full_name || user.email || "?").trim()[0];
+
   return (
-    <>
-      <div className="side-rail left"><span className="rail-text">Exam Schedule - {new Date().getFullYear()}</span></div>
-      <div className="side-rail right"><span className="rail-text">Never miss - Always on time</span></div>
+    <div className="x-app">
+      <div className="x-ambient" aria-hidden="true" />
 
-      <div className="shell">
-        <div className="topbar">
-          <div className="container topbar-inner">
-            <span><b className="coral">●</b> Xamio</span>
-            <span className="mid">
-              <span>Parsed by AI</span>
-              <span>Course matching</span>
-              <span>BYO Calendar</span>
-            </span>
-            <span className="right auth-chip">
-              <span className="pulse" />
-              <span className="auth-email">{user.email}</span>
-              <button className="auth-signout" onClick={signOut}>Sign out</button>
-            </span>
-          </div>
-        </div>
-
-        <header className="nav">
-          <div className="container nav-inner">
-            <a
-              className="brand"
-              href="#"
-              onClick={(event) => {
-                event.preventDefault();
-                // With a schedule in hand, home is the countdown — not a blank
-                // upload box that throws away what we already parsed.
-                exams.length > 0 ? goToDashboard() : reset();
-              }}
-            >
-              <span className="brand-mark">X</span>
-              Xamio
-              <span className="brand-meta">Timetable<b>to Calendar</b></span>
-            </a>
+      <SiteNav
+        brand={
+          <Brand
+            // With a schedule in hand, home is the countdown — not a blank
+            // upload box that throws away what we already parsed.
+            onClick={() => (exams.length > 0 ? goToDashboard() : reset())}
+          />
+        }
+        actions={
+          <>
             {view === "wizard" && exams.length > 0 && (
-              <button className="nav-reset" onClick={goToDashboard}>My schedule</button>
+              <button className="x-nav-link" onClick={goToDashboard}>My schedule</button>
             )}
             {view === "wizard" && step > 0 && (
-              <button className="nav-reset" onClick={reset}>Start over</button>
+              <button className="x-nav-link" onClick={reset}>Start over</button>
             )}
-          </div>
-        </header>
+            <span className="x-user">
+              <span className="x-avatar" aria-hidden="true">{initial}</span>
+              <span className="x-user-email">{user.email}</span>
+              <button className="x-nav-link" onClick={signOut}>Sign out</button>
+            </span>
+          </>
+        }
+      />
 
-        <main className="container page">
+      <main className="x-page">
           {view === "dashboard" ? (
             <Dashboard
               exams={exams}
@@ -297,55 +312,37 @@ export default function App() {
             />
           ) : (
           <>
-          <div className="sec-rule">
-            <span className="roman">{ROMAN[step]}.</span>
-            <span className="meta-grp">
-              <span>Step {step + 1} of {STEPS.length}</span>
-              <span>{STEPS[step]}</span>
-            </span>
-          </div>
-
-          <div className="stepper" style={{ marginBottom: 56 }}>
-            {STEPS.map((label, i) => (
-              <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
-                <span className={`step${i === step ? " active" : i < step ? " done" : ""}`}>
-                  <span className="ring">{i < step ? "✓" : ROMAN[i]}</span>
-                  {label}
+          <nav className="x-steps" aria-label="Progress">
+            {STEPS.map((s, i) => (
+              <button
+                key={s.label}
+                type="button"
+                className={`x-step tone-${s.tone}${i === step ? " active" : i < step ? " done" : ""}`}
+                aria-current={i === step ? "step" : undefined}
+                // Only completed steps are revisitable; jumping ahead would skip
+                // the review the later steps depend on.
+                disabled={i > step}
+                onClick={() => i < step && setStep(i)}
+              >
+                <span className="x-step-n">{i < step ? "✓" : `0${i + 1}`}</span>
+                <span>
+                  {s.label}
+                  <small>{s.hint}</small>
                 </span>
-                {i < STEPS.length - 1 && <span className={`bar${i < step ? " on" : ""}`} />}
-              </span>
+              </button>
             ))}
+          </nav>
+
+          <div className="x-pagehead x-rise" key={step}>
+            <div>
+              <span className="x-tag"><span className="x-dot" /> Step {step + 1} of {STEPS.length}</span>
+              <h1>{head.title}</h1>
+              <p>{head.sub}</p>
+            </div>
           </div>
 
           {step === 0 && (
             <div className="stack-lg">
-              <div className="hero-split">
-                <div className="hero-head">
-                  <span className="label">Exam logistics, automated <span className="ix">- No. 01</span></span>
-                  <h1>Never miss an <em>exam</em> again<span className="dot">.</span></h1>
-                  <p className="lead">
-                    Upload your university exam timetable and the courses you registered for.
-                    AI maps each registered course to the correct exam day, time, code, and venue,
-                    then turns the result into calendar and email alerts.
-                  </p>
-                  <ul className="hero-trust">
-                    <li><span className="ht-dot" />AI parsing with an offline fallback</li>
-                    <li><span className="ht-dot" />Google Calendar &amp; .ics export</li>
-                    <li><span className="ht-dot" />Email reminders before every exam</li>
-                  </ul>
-                </div>
-                <figure className="hero-art" aria-hidden="true">
-                  <img
-                    src="/hero-illustration.png"
-                    alt=""
-                    onError={(e) => {
-                      const split = e.currentTarget.closest(".hero-split");
-                      if (split) split.style.gridTemplateColumns = "1fr";
-                      e.currentTarget.closest(".hero-art").style.display = "none";
-                    }}
-                  />
-                </figure>
-              </div>
               <UploadZone onUpload={handleUpload} loading={loading} />
               {error && <div className="alert error"><span className="glyph">!</span><span>{error}</span></div>}
             </div>
@@ -421,10 +418,19 @@ export default function App() {
                   <b>{selectedExams.length} exam{selectedExams.length !== 1 ? "s" : ""}</b> ready to schedule.
                 </p>
               </div>
-              <ReminderConfig reminders={reminders} onChange={setReminders} />
+              <ReminderConfig
+                reminders={reminders}
+                onChange={setReminders}
+                mode={reminderMode}
+                onModeChange={setReminderMode}
+              />
               <div className="row-between">
                 <button className="link-back" onClick={() => setStep(1)}>Back</button>
-                <button className="btn btn-primary" disabled={reminders.length === 0} onClick={() => setStep(3)}>
+                <button
+                  className="btn btn-primary"
+                  disabled={reminderMode === "custom" && reminders.length === 0}
+                  onClick={() => setStep(3)}
+                >
                   Continue
                   <span className="arrow"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6" /></svg></span>
                 </button>
@@ -435,13 +441,14 @@ export default function App() {
           {step === 3 && (
             <div className="stack-lg">
               {synced && (
-                <div className="panel" style={{ borderColor: "var(--olive)" }}>
-                  <p className="big"><b>You're all set.</b> <span className="roman">Good luck on your exams.</span></p>
+                <div className="panel win x-rise">
+                  <p className="big"><b>You're all set.</b> <em>Good luck on your exams.</em></p>
                 </div>
               )}
               <CalendarSync
                 exams={selectedExams}
                 reminders={reminders}
+                reminderMode={reminderMode}
                 defaultEmail={user.email || ""}
                 staleKeys={staleKeys}
                 onSuccess={(channel) => {
@@ -462,8 +469,8 @@ export default function App() {
           )}
           </>
           )}
-        </main>
-      </div>
-    </>
+      </main>
+      <SiteFooter />
+    </div>
   );
 }

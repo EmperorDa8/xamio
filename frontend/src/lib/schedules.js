@@ -1,4 +1,5 @@
 import { supabase } from "./supabase";
+import { stableKey } from "./stableKey";
 
 /**
  * Persistence for parsed exam schedules (public.schedules + public.schedule_exams).
@@ -34,26 +35,36 @@ function toDateColumn(value) {
   return ISO_DATE.test(v) ? v : null;
 }
 
-/**
- * Mirrors ExamEntry.stable_key() in backend/models.py: sha1 of the normalised
- * course code + date. Keeping the two in step is what will let a re-uploaded
- * timetable be diffed against the stored one rather than duplicated.
- */
-async function stableKey(courseCode, date) {
-  const code = (courseCode || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  const bytes = new TextEncoder().encode(`${code}|${date || ""}`);
-  const digest = await crypto.subtle.digest("SHA-1", bytes);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+/** Item fields added after the first release (migration
+ *  add_item_kind_to_schedule_exams). Without them a restored assignment came
+ *  back as an "exam" — wrong reminders, wrong calendar title, and a different
+ *  calendar key, so the next sync duplicated it. */
+const ITEM_FIELDS = ["kind", "title", "weight_pct", "est_effort_hours", "submission_url"];
+
+const BASE_EXAM_COLUMNS =
+  "course_code, course_name, exam_date, exam_time, duration_minutes, venue, date_verified, date_note";
+
+/** Postgres/PostgREST "that column doesn't exist" — i.e. the migration hasn't
+ *  been applied yet. The app keeps working on the old columns until it is. */
+function isMissingColumn(error) {
+  return error?.code === "42703" || error?.code === "PGRST204" || /column .* does not exist|Could not find the '.*' column/i.test(error?.message || "");
 }
 
-function toExamRows(exams, scheduleId, userId) {
+function toExamRows(exams, scheduleId, userId, { withItemFields = true } = {}) {
   return Promise.all(
     exams.map(async (exam, i) => ({
       schedule_id: scheduleId,
       user_id: userId,
-      stable_key: await stableKey(exam.course_code, exam.date),
+      stable_key: await stableKey(exam),
+      ...(withItemFields
+        ? {
+            kind: exam.kind || "exam",
+            title: exam.title ?? null,
+            weight_pct: exam.weight_pct ?? null,
+            est_effort_hours: exam.est_effort_hours ?? null,
+            submission_url: exam.submission_url ?? null,
+          }
+        : {}),
       course_code: exam.course_code,
       course_name: exam.course_name ?? null,
       exam_date: toDateColumn(exam.date),
@@ -78,7 +89,27 @@ function toExamEntries(rows) {
     venue: r.venue,
     date_verified: r.date_verified,
     date_note: r.date_note,
+    kind: r.kind || "exam",
+    title: r.title ?? null,
+    weight_pct: r.weight_pct ?? null,
+    est_effort_hours: r.est_effort_hours ?? null,
+    submission_url: r.submission_url ?? null,
   }));
+}
+
+/** Upsert exam rows, falling back to the pre-migration columns if needed. */
+async function writeExamRows(exams, scheduleId, userId) {
+  const rows = await toExamRows(exams, scheduleId, userId);
+  let { error } = await supabase
+    .from("schedule_exams")
+    .upsert(rows, { onConflict: "schedule_id,stable_key", ignoreDuplicates: true });
+  if (error && isMissingColumn(error)) {
+    const legacy = await toExamRows(exams, scheduleId, userId, { withItemFields: false });
+    ({ error } = await supabase
+      .from("schedule_exams")
+      .upsert(legacy, { onConflict: "schedule_id,stable_key", ignoreDuplicates: true }));
+  }
+  if (error) throw error;
 }
 
 async function currentUser() {
@@ -125,11 +156,7 @@ export async function saveSchedule({
   if (scheduleError) throw scheduleError;
 
   if (exams?.length) {
-    const rows = await toExamRows(exams, schedule.id, user.id);
-    const { error: examsError } = await supabase
-      .from("schedule_exams")
-      .upsert(rows, { onConflict: "schedule_id,stable_key", ignoreDuplicates: true });
-    if (examsError) throw examsError;
+    await writeExamRows(exams, schedule.id, user.id);
   }
 
   return schedule.id;
@@ -151,11 +178,7 @@ export async function replaceScheduleExams(scheduleId, exams) {
 
   if (!exams?.length) return;
 
-  const rows = await toExamRows(exams, scheduleId, user.id);
-  const { error } = await supabase
-    .from("schedule_exams")
-    .upsert(rows, { onConflict: "schedule_id,stable_key", ignoreDuplicates: true });
-  if (error) throw error;
+  await writeExamRows(exams, scheduleId, user.id);
 }
 
 /**
@@ -178,13 +201,19 @@ export async function loadLatestSchedule() {
   if (error) throw error;
   if (!schedule) return null;
 
-  const { data: rows, error: examsError } = await supabase
-    .from("schedule_exams")
-    .select(
-      "course_code, course_name, exam_date, exam_time, duration_minutes, venue, date_verified, date_note",
-    )
-    .eq("schedule_id", schedule.id)
-    .order("position", { ascending: true });
+  const readRows = (columns) =>
+    supabase
+      .from("schedule_exams")
+      .select(columns)
+      .eq("schedule_id", schedule.id)
+      .order("position", { ascending: true });
+
+  let { data: rows, error: examsError } = await readRows(
+    `${BASE_EXAM_COLUMNS}, ${ITEM_FIELDS.join(", ")}`,
+  );
+  if (examsError && isMissingColumn(examsError)) {
+    ({ data: rows, error: examsError } = await readRows(BASE_EXAM_COLUMNS));
+  }
 
   if (examsError) throw examsError;
 
@@ -199,6 +228,16 @@ export async function loadLatestSchedule() {
     timezone: schedule.timezone,
     createdAt: schedule.created_at,
   };
+}
+
+/** What makes two rows "the same item" across uploads. Deliberately NOT the
+ *  date — a moved exam must still pair up with its old self. */
+function itemIdentity(exam) {
+  const code = normCode(exam.course_code);
+  if (!code) return "";
+  const kind = exam.kind || "exam";
+  if (kind === "exam") return code;
+  return `${code}|${kind}|${(exam.title || "").trim().toLowerCase()}`;
 }
 
 /**
@@ -216,7 +255,7 @@ export async function loadLatestSchedule() {
 export function diffSchedules(previousExams, nextExams) {
   const before = new Map();
   for (const exam of previousExams || []) {
-    const key = normCode(exam.course_code);
+    const key = itemIdentity(exam);
     // First occurrence wins: a duplicated code in the old schedule shouldn't
     // change which row we consider the "before" state.
     if (key && !before.has(key)) before.set(key, exam);
@@ -228,7 +267,7 @@ export function diffSchedules(previousExams, nextExams) {
   const unchanged = [];
 
   for (const exam of nextExams || []) {
-    const key = normCode(exam.course_code);
+    const key = itemIdentity(exam);
     const previous = key ? before.get(key) : null;
     if (!previous) {
       added.push(exam);
@@ -290,7 +329,7 @@ export async function staleKeysFor(diff) {
       .filter((entry) => entry.changes.some((c) => c.field === "date"))
       .map((entry) => entry.before),
   ];
-  return Promise.all(obsolete.map((exam) => stableKey(exam.course_code, exam.date)));
+  return Promise.all(obsolete.map((exam) => stableKey(exam)));
 }
 
 /** Discard a stored schedule (cascades to its exams). */

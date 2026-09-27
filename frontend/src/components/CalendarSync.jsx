@@ -8,6 +8,7 @@ const API = import.meta.env.VITE_API_URL || "/api";
 export default function CalendarSync({
   exams,
   reminders,
+  reminderMode = "smart",
   onSuccess,
   defaultEmail = "",
   // Calendar keys for exams that moved or were dropped since the last upload —
@@ -51,7 +52,7 @@ export default function CalendarSync({
     try {
       const { data } = await axios.post(
         `${API}/sync/google`,
-        { exams, reminder_minutes: reminders, timezone, stale_keys: staleKeys },
+        { exams, reminder_minutes: reminders, reminder_mode: reminderMode, timezone, stale_keys: staleKeys },
         { withCredentials: true },
       );
       setMessage({ type: "success", text: data.message, notes: data.warnings });
@@ -69,7 +70,7 @@ export default function CalendarSync({
     try {
       const response = await axios.post(
         `${API}/download/ics`,
-        { exams, reminder_minutes: reminders, timezone },
+        { exams, reminder_minutes: reminders, reminder_mode: reminderMode, timezone },
         { responseType: "blob", withCredentials: true },
       );
       const url = URL.createObjectURL(new Blob([response.data], { type: "text/calendar" }));
@@ -93,7 +94,7 @@ export default function CalendarSync({
     try {
       const { data } = await axios.post(
         `${API}/alerts/email`,
-        { email, exams, reminder_minutes: reminders, timezone },
+        { email, exams, reminder_minutes: reminders, reminder_mode: reminderMode, timezone },
         { withCredentials: true },
       );
       setMessage({ type: "success", text: data.message, notes: data.warnings });
@@ -120,12 +121,19 @@ export default function CalendarSync({
   };
 
   const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-  const disabled = exams.length === 0 || reminders.length === 0;
+  // In smart mode the ladders come from the backend, so an empty custom
+  // preset list is not a reason to block the export.
+  const disabled =
+    exams.length === 0 || (reminderMode === "custom" && reminders.length === 0);
 
   return (
     <div>
-      <h2 className="section-h2">Add to your <em>calendar</em></h2>
-      <p className="coord" style={{ marginBottom: 20 }}>{exams.length} exam{exams.length !== 1 ? "s" : ""} - {reminders.length} alert{reminders.length !== 1 ? "s" : ""} each</p>
+      <p className="coord" style={{ marginBottom: 20 }}>
+        {exams.length} item{exams.length !== 1 ? "s" : ""} -{" "}
+        {reminderMode === "smart"
+          ? "reminders picked from what each one is"
+          : `${reminders.length} alert${reminders.length !== 1 ? "s" : ""} each`}
+      </p>
 
       <div className="sync-grid">
         <button onClick={downloadIcs} disabled={disabled || downloading} className="sync-option">

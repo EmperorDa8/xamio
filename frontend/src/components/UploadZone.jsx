@@ -34,7 +34,7 @@ export default function UploadZone({ onUpload, loading }) {
           dropping the timetable (which auto-submits the parse). */}
       <div className="course-card">
         <div>
-          <h3>1. Registered courses</h3>
+          <h3><span className="x-num">01</span> Your registered courses</h3>
           <p className="sub">Start here — paste your course codes (or attach your registration file) so we match only your exams. Then upload your timetable.</p>
         </div>
 
@@ -76,8 +76,7 @@ export default function UploadZone({ onUpload, loading }) {
           onChange={(event) => chooseTimetable(event.target.files?.[0])}
         />
 
-        <span className="corner tl" /><span className="corner tr" />
-        <span className="corner bl" /><span className="corner br" />
+        {loading && <span className="upload-beam" aria-hidden="true" />}
 
         <div className={`upload-mark${loading ? " spin" : ""}`}>
           {loading ? (
@@ -91,12 +90,23 @@ export default function UploadZone({ onUpload, loading }) {
         </div>
 
         <div style={{ textAlign: "center" }}>
-          <h3>{loading ? <>Reading your <em>timetable</em>...</> : <>2. Drop your <em>timetable</em> here</>}</h3>
-          <p className="sub">PDF, image, Excel, CSV, DOCX, or TXT parsed into exact exam dates</p>
+          <h3>{loading ? <>Reading your <em>timetable</em>…</> : <>Drop your <em>timetable</em> here</>}</h3>
+          <p className="sub">
+            {loading
+              ? "Finding every exam and matching it to your courses"
+              : "Step 02 — we'll read it and pull out every exam"}
+          </p>
           {timetableFile && <p className="file-name">{timetableFile.name}</p>}
         </div>
 
-        {!loading && <span className="chip">Click to browse</span>}
+        {!loading && (
+          <>
+            <div className="upload-formats" aria-label="Supported formats">
+              {["PDF", "JPG", "PNG", "XLSX", "CSV", "DOCX", "TXT"].map((f) => <span key={f}>{f}</span>)}
+            </div>
+            <span className="chip">Click to browse</span>
+          </>
+        )}
       </div>
     </div>
   );
