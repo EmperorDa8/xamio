@@ -1,5 +1,13 @@
 import { useState } from "react";
 import { supabase } from "../lib/supabase";
+import SiteNav, { Brand } from "./SiteNav";
+
+// A glimpse of the result, so the sign-up form sits next to the payoff.
+const PREVIEW = [
+  { code: "CSC 201", title: "Data Structures", when: "Thu · 9:00 AM · Hall B", count: "in 4 days", tone: "pink" },
+  { code: "MTH 211", title: "Linear Algebra", when: "Fri · 1:00 PM · LT 3", count: "in 5 days", tone: "peach" },
+  { code: "CSC 209", title: "Database Systems", when: "Tue · 1:00 PM · Lab 2", count: "in 9 days", tone: "mint" },
+];
 
 export default function Auth({ initialMode = "signin", onBack }) {
   const [mode, setMode] = useState(initialMode); // "signin" | "signup"
@@ -53,15 +61,21 @@ export default function Auth({ initialMode = "signin", onBack }) {
 
   return (
     <div className="auth-wrap">
-      <div className="auth-card">
-        {onBack && (
-          <button type="button" className="link-back auth-back" onClick={onBack}>
-            ← Back to home
-          </button>
-        )}
+      <div className="x-ambient" aria-hidden="true" />
+      <SiteNav
+        brand={<Brand onClick={onBack} />}
+        actions={
+          onBack && (
+            <button type="button" className="x-nav-link" onClick={onBack}>← Back to home</button>
+          )
+        }
+      />
+
+      <div className="auth-body">
+      <div className="auth-card x-rise">
         <div className="auth-head">
-          <span className="brand-mark">X</span>
-          <h1>{isSignup ? "Create your account" : "Welcome back"}</h1>
+          <span className="x-tag soft"><span className="x-dot" /> {isSignup ? "Free for students" : "Good to see you"}</span>
+          <h1>{isSignup ? <>Create your <em>account</em></> : <>Welcome <em>back</em></>}</h1>
           <p className="lead">
             {isSignup
               ? "Sign up to turn your exam timetable into calendar events and reminders."
@@ -141,6 +155,28 @@ export default function Auth({ initialMode = "signin", onBack }) {
             {isSignup ? "Sign in" : "Create one"}
           </button>
         </p>
+      </div>
+
+      <aside className="auth-art" aria-hidden="true">
+        <h2>Your exams, <em>already sorted</em>.</h2>
+        <div className="auth-stack">
+          {PREVIEW.map((p) => (
+            <article key={p.code} className={`ti-card tone-${p.tone}`}>
+              <div className="ti-card-top">
+                <span className="ti-card-code">{p.code}</span>
+                <span className="ti-card-count">{p.count}</span>
+              </div>
+              <h4>{p.title}</h4>
+              <p>{p.when}</p>
+            </article>
+          ))}
+        </div>
+        <ul>
+          <li>Reads any timetable file</li>
+          <li>Only the courses you take</li>
+          <li>Reminders before every paper</li>
+        </ul>
+      </aside>
       </div>
     </div>
   );

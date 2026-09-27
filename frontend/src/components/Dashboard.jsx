@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import { useTilt } from "./landing/hooks";
+
+const TONES = ["peach", "lavender", "mint", "sky", "pink"];
 
 /**
  * The home screen for a student who already has a parsed timetable.
@@ -86,6 +89,7 @@ export default function Dashboard({
     };
   }, [exams, now]);
 
+  const tiltRef = useTilt(5);
   const next = upcoming[0];
   const remaining = countdown(next?.when ?? 0, now);
 
@@ -93,9 +97,7 @@ export default function Dashboard({
     <div className="stack-lg">
       <div className="dash-head">
         <div>
-          <span className="label">
-            Your schedule <span className="ix">- No. 01</span>
-          </span>
+          <span className="x-tag"><span className="x-dot" /> Your schedule</span>
           <h1>
             {upcoming.length > 0 ? (
               <>
@@ -115,14 +117,15 @@ export default function Dashboard({
       </div>
 
       {next ? (
-        <div className="next-exam">
+        <div className="next-exam x-tilt x-rise" ref={tiltRef}>
           <div className="ne-left">
-            <span className="coord">next exam</span>
+            <span className="x-tag">Next up</span>
             <p className="ne-code">{next.exam.course_code}</p>
-            {next.exam.course_name && <p className="ne-name">{next.exam.course_name}</p>}
+            <p className="ne-name">{next.exam.course_name || next.exam.title || next.exam.course_code}</p>
             <p className="ne-when">
-              {formatDay(next.when)} · {formatTime(next.exam)}
-              {next.exam.venue ? ` · ${next.exam.venue}` : ""}
+              <span>{formatDay(next.when)}</span>
+              <span>{formatTime(next.exam)}</span>
+              {next.exam.venue && <span>{next.exam.venue}</span>}
             </p>
           </div>
           <div className="ne-right">
@@ -130,14 +133,15 @@ export default function Dashboard({
             <span className="ne-unit">{remaining?.unit ?? "minutes"}</span>
             {remaining?.detail && <span className="ne-detail">{remaining.detail}</span>}
           </div>
+          <span className="x-glare" aria-hidden="true" />
         </div>
       ) : (
         <div className="panel">
           <p className="big">
             <b>No upcoming exams.</b>{" "}
-            <span className="roman">
+            <em>
               {past.length > 0 ? "Every exam on this timetable has passed." : "Upload a timetable to get started."}
-            </span>
+            </em>
           </p>
         </div>
       )}
@@ -154,15 +158,24 @@ export default function Dashboard({
             {upcoming.slice(1).map(({ exam, when }, i) => {
               const away = countdown(when, now);
               return (
-                <li key={`${exam.course_code}-${exam.date}-${i}`}>
-                  <span className="ef-code">{exam.course_code}</span>
+                <li
+                  key={`${exam.course_code}-${exam.date}-${i}`}
+                  className={`tone-${TONES[i % TONES.length]}`}
+                  style={{ "--i": i }}
+                >
+                  <span className="ef-top">
+                    <span className="ef-code">{exam.course_code}</span>
+                    <span className="ef-away">
+                      in {away?.value} {away?.unit}
+                    </span>
+                  </span>
+                  {(exam.course_name || exam.title) && (
+                    <span className="ef-name">{exam.course_name || exam.title}</span>
+                  )}
                   <span className="ef-when">
                     {formatDay(when)} · {formatTime(exam)}
                   </span>
-                  <span className="ef-venue">{exam.venue || ""}</span>
-                  <span className="ef-away">
-                    in {away?.value} {away?.unit}
-                  </span>
+                  {exam.venue && <span className="ef-venue">{exam.venue}</span>}
                 </li>
               );
             })}
@@ -192,13 +205,15 @@ export default function Dashboard({
           </summary>
           <ul className="exam-feed done">
             {past.map(({ exam, when }, i) => (
-              <li key={`${exam.course_code}-${exam.date}-${i}`}>
-                <span className="ef-code">{exam.course_code}</span>
+              <li key={`${exam.course_code}-${exam.date}-${i}`} style={{ "--i": i }}>
+                <span className="ef-top">
+                  <span className="ef-code">{exam.course_code}</span>
+                  <span className="ef-away">done ✓</span>
+                </span>
                 <span className="ef-when">
                   {formatDay(when)} · {formatTime(exam)}
                 </span>
-                <span className="ef-venue">{exam.venue || ""}</span>
-                <span className="ef-away">done</span>
+                {exam.venue && <span className="ef-venue">{exam.venue}</span>}
               </li>
             ))}
           </ul>
