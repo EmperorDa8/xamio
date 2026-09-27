@@ -2,14 +2,16 @@ import { useState } from "react";
 import "./landing/landing.css";
 import HeroScene from "./landing/HeroScene";
 import TryIt from "./landing/TryIt";
+import WhatsNew from "./landing/WhatsNew";
+import "./landing/whatsnew.css";
 import SiteNav, { Brand, SiteFooter } from "./SiteNav";
 import { useReveal, useTilt } from "./landing/hooks";
 import { IconScan, IconTarget, IconCalendar, IconBell, IconArrow, IconDownload, IconLayers } from "./icons";
 
-const FORMATS = ["PDF", "PNG", "JPG", "XLSX", "CSV", "DOCX", "TXT", "Google Calendar", ".ics", "Email"];
+const FORMATS = ["Photo", "PDF", "Syllabus", "XLSX", "XLS", "DOCX", "CSV", "TXT", "Google Calendar", ".ics", "Email"];
 
 const STEPS = [
-  { n: "01", t: "Upload", d: "Drop the timetable exactly as the faculty sent it — PDF, photo, spreadsheet, Word. Add your registered courses.", tone: "pink" },
+  { n: "01", t: "Upload", d: "Drop the timetable exactly as the faculty sent it — or snap a photo of it. Add a syllabus for your deadlines too.", tone: "pink" },
   { n: "02", t: "Review", d: "AI pulls out every exam and keeps only the ones you take. Fix anything before it goes anywhere.", tone: "peach" },
   { n: "03", t: "Alerts", d: "Smart reminders by type, or pick your own — the day before, 3 hours before, whatever keeps you calm.", tone: "lavender" },
   { n: "04", t: "Sync", d: "Straight into Google Calendar, or download a .ics for any calendar app. Emails land on time.", tone: "mint" },
@@ -65,6 +67,7 @@ export default function Landing({ onStart }) {
         brand={<Brand />}
         links={
           <>
+            <a href="#new" className="has-dot">What's new</a>
             <a href="#try">Try it</a>
             <a href="#how">How it works</a>
             <a href="#educators">For educators</a>
@@ -85,12 +88,16 @@ export default function Landing({ onStart }) {
             <span className="xl-eyebrow">
               <span className="x-pulse" /> Free for students · early access
             </span>
+            <a className="xl-newpill" href="#new">
+              <b>New</b> Snap a photo of your timetable →
+            </a>
             <h1>
               Never miss an <em>exam</em> again<span className="coral">.</span>
             </h1>
             <p className="xl-lead">
-              The timetable is fourteen pages. Your exams fit on one card. Upload it, and Xamio
-              finds yours, puts them in your calendar, and reminds you before each one.
+              The timetable is fourteen pages. Your exams fit on one card. Upload it — or just
+              photograph it — and Xamio finds yours, adds your assignment deadlines, puts it all in
+              your calendar, and reminds you at the right moment.
             </p>
             <div className="xl-audience">
               <button className="x-btn x-btn-primary x-btn-lg" onClick={() => onStart("signup")}>
@@ -101,7 +108,7 @@ export default function Landing({ onStart }) {
             </div>
             <ul className="xl-trust">
               <li>No credit card</li>
-              <li>Any file format</li>
+              <li>Photo, PDF or spreadsheet</li>
               <li>Under a minute</li>
             </ul>
           </div>
@@ -118,6 +125,18 @@ export default function Landing({ onStart }) {
             ))}
           </div>
         </div>
+
+        {/* ───────── what's new ───────── */}
+        <section className="xl-section" id="new">
+          <div className="xl-sec-head" data-reveal>
+            <span className="x-tag">New in Xamio</span>
+            <h2>Less to set up. <em>Less noise.</em> Nothing missed.</h2>
+            <p>Five things we've added since launch. Tap through them, or watch them play.</p>
+          </div>
+          <div data-reveal>
+            <WhatsNew />
+          </div>
+        </section>
 
         {/* ───────── interactive demo ───────── */}
         <section className="xl-section" id="try">
@@ -158,10 +177,10 @@ export default function Landing({ onStart }) {
           <div className="xl-bento">
             <TiltCard className="b-wide tone-pink" data-reveal>
               <span className="b-ico"><IconScan /></span>
-              <h3>Reads any timetable</h3>
-              <p>PDF, a photo of the notice board, spreadsheet, Word or plain text. AI reads it; an offline extractor backs it up.</p>
+              <h3>Reads any timetable — or syllabus</h3>
+              <p>A photo of the notice board, PDF, spreadsheet, Word or plain text. Upload a syllabus too and every essay and homework deadline comes with it.</p>
               <div className="b-files">
-                {["PDF", "JPG", "XLSX", "DOCX", "CSV", "TXT"].map((f, i) => (
+                {["Photo", "PDF", "XLSX", "XLS", "DOCX", "CSV", "TXT"].map((f, i) => (
                   <span key={f} style={{ "--i": i }}>{f}</span>
                 ))}
               </div>

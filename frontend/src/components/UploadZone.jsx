@@ -94,7 +94,7 @@ export default function UploadZone({ onUpload, loading }) {
           <p className="sub">
             {loading
               ? "Finding every exam and matching it to your courses"
-              : "Step 02 — we'll read it and pull out every exam"}
+              : "Timetable, syllabus or assignment brief — or a photo of the notice board"}
           </p>
           {timetableFile && <p className="file-name">{timetableFile.name}</p>}
         </div>
@@ -102,7 +102,9 @@ export default function UploadZone({ onUpload, loading }) {
         {!loading && (
           <>
             <div className="upload-formats" aria-label="Supported formats">
-              {["PDF", "JPG", "PNG", "XLSX", "CSV", "DOCX", "TXT"].map((f) => <span key={f}>{f}</span>)}
+              {["Photo", "PDF", "XLSX", "XLS", "DOCX", "CSV", "TXT"].map((f) => (
+                <span key={f} className={f === "Photo" ? "is-new" : undefined}>{f}</span>
+              ))}
             </div>
             <span className="chip">Click to browse</span>
           </>
