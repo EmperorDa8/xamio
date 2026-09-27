@@ -5,8 +5,13 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from models import ExamEntry
 from services.datetime_utils import parse_exam_datetime_in_timezone
+from services.ical_service import DEADLINE_EVENT_MINUTES, KIND_PREFIX
+from services import reminder_policy
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+
+# Google Calendar rejects an event with more than five reminder overrides.
+MAX_GOOGLE_REMINDERS = 5
 
 
 def get_flow() -> Flow:
@@ -71,9 +76,10 @@ def _delete_events_by_key(service, exam_key: str) -> int:
 def sync_exams_to_google(
     credentials_dict: dict,
     exams: list[ExamEntry],
-    reminder_minutes: list[int],
+    reminder_minutes: list[int] | None = None,
     timezone: str = "UTC",
     stale_keys: list[str] | None = None,
+    mode: str = "smart",
 ) -> tuple[list[str], int]:
     creds = Credentials(
         token=credentials_dict["token"],
@@ -100,25 +106,44 @@ def sync_exams_to_google(
         dt_start = parse_exam_datetime_in_timezone(exam.date, exam.time, timezone)
         if dt_start is None:
             continue  # skip unrecoverable rows rather than failing the whole sync
-        dt_end = dt_start + timedelta(minutes=exam.duration_minutes or 120)
+        # A sitting takes a block of the day; a deadline is a moment. See
+        # ical_service for why a deadline still gets a short non-zero block.
+        if exam.is_attended:
+            dt_end = dt_start + timedelta(minutes=exam.duration_minutes or 120)
+        else:
+            dt_end = dt_start + timedelta(minutes=DEADLINE_EVENT_MINUTES)
 
         description_parts = []
         if exam.course_name:
             description_parts.append(f"Course: {exam.course_name}")
         if exam.venue:
             description_parts.append(f"Venue: {exam.venue}")
-        description_parts.append(f"Duration: {exam.duration_minutes or 120} minutes")
+        if exam.is_attended:
+            description_parts.append(f"Duration: {exam.duration_minutes or 120} minutes")
+        if exam.weight_pct is not None:
+            description_parts.append(f"Worth: {exam.weight_pct:g}% of the final grade")
+        if exam.submission_url:
+            description_parts.append(f"Submit: {exam.submission_url}")
 
         exam_key = exam.stable_key()
         event_body = {
-            "summary": f"EXAM: {exam.course_code}",
+            "summary": f"{KIND_PREFIX[exam.kind]}: {exam.display_name()}",
             "description": "\n".join(description_parts),
             "start": {"dateTime": dt_start.isoformat(), "timeZone": timezone},
             "end": {"dateTime": dt_end.isoformat(), "timeZone": timezone},
             "reminders": {
                 "useDefault": False,
                 "overrides": [
-                    {"method": "popup", "minutes": m} for m in reminder_minutes
+                    # Per item, from its kind — see services/reminder_policy.
+                    # Google rejects an event carrying more than
+                    # MAX_GOOGLE_REMINDERS overrides, so the ladder is trimmed
+                    # to the rungs NEAREST the deadline: if something has to go,
+                    # the "two weeks out" nudge is worth less than the one the
+                    # night before.
+                    {"method": "popup", "minutes": m}
+                    for m in sorted(
+                        reminder_policy.minutes_for(exam, mode, reminder_minutes)
+                    )[:MAX_GOOGLE_REMINDERS]
                 ],
             },
             # Tag the event so a re-sync can find and update it (see below).

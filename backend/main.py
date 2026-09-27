@@ -1,11 +1,17 @@
+import html
 import logging
 import os
 import secrets
 from datetime import datetime, timedelta
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+import anyio
 from fastapi.responses import Response, RedirectResponse
-from dotenv import load_dotenv
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -20,17 +26,27 @@ from models import (
 from services.parser import parse_timetable
 from services.ical_service import build_ics
 from services.google_calendar import get_auth_url_and_state, exchange_code, sync_exams_to_google
-from services.email_service import send_summary_email, send_reminder_email
+from services.email_service import (
+    check_email_config,
+    send_digest_email,
+    send_reminder_email,
+    send_summary_email,
+)
 from services import reminder_queue
+from services import done_tokens
 from services import token_store
+from services import tickets
 from services.auth import require_user
-
-load_dotenv()
 
 # Reject uploads larger than this to protect memory and AI token spend.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
 
 limiter = Limiter(key_func=get_remote_address)
+
+# Parsing is CPU-bound pure Python (pdfplumber) plus slow AI calls. Letting
+# every upload run at once starves the rest of the API of the interpreter; a
+# small cap keeps /health, .ics and email responsive while uploads queue.
+PARSE_SLOTS = anyio.CapacityLimiter(int(os.getenv("PARSE_CONCURRENCY", "2")))
 
 app = FastAPI(title="Exam Timer API")
 app.state.limiter = limiter
@@ -39,6 +55,13 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.on_event("startup")
 def _startup():
+    # Say up front if email cannot actually reach students. This one fails
+    # silently otherwise: everything looks healthy, reminders queue and get
+    # marked sent, and only the account owner ever receives one.
+    email_problem = check_email_config()
+    if email_problem:
+        logging.getLogger("xamio").warning("Email: %s", email_problem)
+
     # Warm the queue table. Failure is logged, never fatal: a bad DATABASE_URL
     # must not stop the service binding a port, or /health and /parse go down
     # with it even though neither touches Postgres. The tables are created
@@ -95,21 +118,27 @@ def _validate_exam_schedule(exams) -> list[str]:
     is reported, and as a returned warning rather than a block: an overlap is
     usually a parse slip worth a second look, but it is the university's
     timetable, and refusing to export it helps nobody.
+
+    Overlap only means anything for things you attend. A deadline occupies no
+    time — five assignments due at 23:59 on the same Friday is a hard week, not
+    a conflict, and warning about it would make the warnings worthless.
     """
     from services.datetime_utils import parse_exam_datetime
 
     problems: list[str] = []
     warnings: list[str] = []
-    # date -> (course code, start, end) for the exams we could place in time
+    # date -> (course code, start, end) for the sittings we could place in time
     by_date: dict[str, list[tuple[str, datetime, datetime]]] = {}
 
     for exam in exams:
         start = parse_exam_datetime(exam.date, exam.time)
         if start is None:
             problems.append(
-                f"{exam.course_code}: invalid or missing date/time "
+                f"{exam.display_name()}: invalid or missing date/time "
                 f"(date={exam.date!r}, time={exam.time!r})."
             )
+            continue
+        if not exam.is_attended:
             continue
         end = start + timedelta(minutes=exam.duration_minutes or 120)
         by_date.setdefault(exam.date, []).append((exam.course_code, start, end))
@@ -133,6 +162,15 @@ def _validate_exam_schedule(exams) -> list[str]:
                 )
 
     return warnings
+
+
+def _validate_timezone(name: str) -> None:
+    from zoneinfo import ZoneInfo
+
+    try:
+        ZoneInfo(name)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Unknown timezone: {name!r}")
 
 
 @app.get("/health")
@@ -172,24 +210,39 @@ async def parse(
                 detail=f"Course list file too large. Maximum size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
             )
 
+    # PDF extraction and the AI calls block for seconds (up to 2x45s on a
+    # slow provider). Run them in the threadpool: on the event loop, one long
+    # upload froze the whole API — health checks included — for every user.
     try:
-        result = parse_timetable(
-            file.filename,
-            file_bytes,
-            registered_courses_text=courses_text,
-            registered_courses_filename=courses_file.filename if courses_file else None,
-            registered_courses_bytes=courses_bytes,
+        result = await anyio.to_thread.run_sync(
+            lambda: parse_timetable(
+                file.filename,
+                file_bytes,
+                registered_courses_text=courses_text,
+                registered_courses_filename=courses_file.filename if courses_file else None,
+                registered_courses_bytes=courses_bytes,
+            ),
+            limiter=PARSE_SLOTS,
         )
-    except Exception as e:
+    except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logging.getLogger("xamio").exception("parse failed for %s", file.filename)
+        raise HTTPException(
+            status_code=422,
+            detail="We couldn't read that file. Try a PDF, spreadsheet or Word export of the timetable.",
+        )
 
     return result
 
 
 @app.post("/download/ics")
-async def download_ics(body: SyncRequest, user: dict = Depends(require_user)):
+def download_ics(body: SyncRequest, user: dict = Depends(require_user)):
     _validate_exam_schedule(body.exams)
-    ics_bytes = build_ics(body.exams, body.reminder_minutes, body.timezone)
+    _validate_timezone(body.timezone)
+    ics_bytes = build_ics(
+        body.exams, body.reminder_minutes, body.timezone, mode=body.reminder_mode
+    )
     return Response(
         content=ics_bytes,
         media_type="text/calendar",
@@ -199,7 +252,7 @@ async def download_ics(body: SyncRequest, user: dict = Depends(require_user)):
 
 @app.post("/alerts/email", response_model=EmailAlertResult)
 @limiter.limit("5/minute")
-async def email_alerts(
+def email_alerts(
     request: Request, body: EmailAlertRequest, user: dict = Depends(require_user)
 ):
     if not body.exams:
@@ -214,13 +267,20 @@ async def email_alerts(
         )
     warnings = _validate_exam_schedule(body.exams)
     try:
-        send_summary_email(body.email, body.exams, body.reminder_minutes, body.timezone)
+        send_summary_email(
+            body.email,
+            body.exams,
+            body.reminder_minutes,
+            body.timezone,
+            mode=body.reminder_mode,
+        )
         scheduled = reminder_queue.schedule_exam_reminders(
             body.email,
             body.exams,
             body.reminder_minutes,
             body.timezone,
             user_id=user.get("sub"),
+            mode=body.reminder_mode,
         )
     except ValueError as e:
         raise HTTPException(status_code=501, detail=str(e))
@@ -280,10 +340,22 @@ def dispatch_reminders(x_task_key: str | None = Header(default=None)):
 
     sent = 0
     failed = 0
+    skipped = 0
     for item in due:
+        action, detail = reminder_queue.triage(item)
+        if action == "cancel":
+            reminder_queue.mark_cancelled(item["id"], detail)
+            skipped += 1
+            continue
+        payload = detail
         try:
             if item["channel"] == "email":
-                send_reminder_email(item["destination"], item["payload"])
+                # A digest row stands in for several reminders that landed on
+                # one day; see services/reminder_budget.
+                if payload.get("digest"):
+                    send_digest_email(item["destination"], payload)
+                else:
+                    send_reminder_email(item["destination"], payload)
             else:
                 # whatsapp/sms are queued but have no sender wired up yet.
                 raise RuntimeError(f"No sender for channel {item['channel']!r}")
@@ -299,6 +371,7 @@ def dispatch_reminders(x_task_key: str | None = Header(default=None)):
         "claimed": len(due),
         "sent": sent,
         "failed": failed,
+        "skipped_stale": skipped,
         "reclaimed": reclaimed,
         "queue": reminder_queue.stats(),
     }
@@ -312,6 +385,84 @@ def reminder_stats(x_task_key: str | None = Header(default=None)):
     return reminder_queue.stats()
 
 
+def _done_page(title: str, message: str, token: str | None = None) -> Response:
+    """Small self-contained page. No JS, no external assets — it is opened from
+    an email client's browser, often on a phone, sometimes offline-ish."""
+    action = ""
+    if token:
+        action = (
+            '<form method="post" action="/reminders/done">'
+            f'<input type="hidden" name="token" value="{html.escape(token)}">'
+            '<button type="submit">Yes, stop reminding me</button>'
+            "</form>"
+        )
+    return Response(
+        content=(
+            "<!doctype html><meta charset=utf-8>"
+            '<meta name=viewport content="width=device-width,initial-scale=1">'
+            "<title>Xamio</title>"
+            "<style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:15vh auto;"
+            "padding:0 1.5rem;color:#15140f;background:#faf8f3;line-height:1.5}"
+            "h1{font-size:1.25rem;margin:0 0 .5rem}p{color:#555}"
+            "button{margin-top:1.5rem;padding:.7rem 1.4rem;font-size:1rem;border:0;"
+            "border-radius:8px;background:#d65a3c;color:#fff;cursor:pointer}</style>"
+            f"<h1>{html.escape(title)}</h1><p>{html.escape(message)}</p>{action}"
+        ),
+        media_type="text/html",
+    )
+
+
+@app.get("/reminders/done")
+def done_confirm(token: str = ""):
+    """Landing page for the "done" link in a reminder email.
+
+    Deliberately does NOT cancel anything. Mail clients and security scanners
+    fetch the links in a message before anyone opens it, so a GET that changed
+    state would silence reminders the student never touched. The cancel happens
+    on the POST below, which a scanner will not perform.
+    """
+    try:
+        body = done_tokens.parse_token(token)
+    except done_tokens.TokenError as e:
+        return _done_page("That link didn't work", str(e))
+
+    label = body.get("c") or "this"
+    return _done_page(
+        "Mark this as done?",
+        f"We'll stop the remaining reminders for {label}. "
+        "Your calendar entries stay where they are.",
+        token=token,
+    )
+
+
+@app.post("/reminders/done")
+@limiter.limit("20/minute")
+def done_submit(request: Request, token: str = Form(default="")):
+    try:
+        body = done_tokens.parse_token(token)
+    except done_tokens.TokenError as e:
+        return _done_page("That link didn't work", str(e))
+
+    stopped = reminder_queue.cancel_item(
+        destination=body["to"],
+        stable_key=body.get("sk"),
+        course_code=body.get("c"),
+        date=body.get("d"),
+        time_str=body.get("t"),
+        kind=body.get("k") or "exam",
+    )
+    if stopped:
+        return _done_page(
+            "Done — nicely handled.",
+            f"{stopped} reminder{'s' if stopped != 1 else ''} stopped. "
+            "You'll still hear about everything else.",
+        )
+    return _done_page(
+        "Already taken care of",
+        "There were no reminders left to stop for this one.",
+    )
+
+
 @app.get("/auth/google", response_model=GoogleAuthResponse)
 def google_auth(request: Request, user: dict = Depends(require_user)):
     if not os.getenv("GOOGLE_CLIENT_ID"):
@@ -319,26 +470,27 @@ def google_auth(request: Request, user: dict = Depends(require_user)):
     # Hand back our own /start URL: the browser navigates there top-level, so
     # the CSRF state cookie is set first-party on this origin before Google.
     base = str(request.base_url).rstrip("/")
-    return {"auth_url": f"{base}/auth/google/start"}
+    # A top-level navigation can't carry the Bearer token, so hand the browser a
+    # short-lived signed ticket naming the user. The callback uses it to store
+    # the Google tokens against that user — not against a cookie, which Safari
+    # and Firefox drop on the later cross-site sync/status requests.
+    ticket = tickets.issue({"sub": user.get("sub")}, ttl_seconds=600)
+    return {"auth_url": f"{base}/auth/google/start?ticket={ticket}"}
 
 
 @app.get("/auth/google/start")
-def google_auth_start():
-    """Top-level navigation target: stamp the CSRF state cookie, then redirect
-    to Google's consent screen. No auth needed — starting a consent flow has no
-    side effects and the client id is public anyway."""
+def google_auth_start(ticket: str = ""):
+    """Top-level navigation target: stamp the CSRF state cookie (and the user
+    ticket), then redirect to Google's consent screen."""
     if not os.getenv("GOOGLE_CLIENT_ID"):
         raise HTTPException(status_code=501, detail="Google Calendar not configured. Add GOOGLE_CLIENT_ID to .env")
     auth_url, state = get_auth_url_and_state()
     response = RedirectResponse(auth_url)
-    response.set_cookie(
-        "oauth_state",
-        state,
-        httponly=True,
-        samesite="lax",  # sent on the top-level redirect back from Google
-        secure=_SECURE_COOKIES,
-        max_age=600,
-    )
+    cookie = dict(httponly=True, samesite="lax", secure=_SECURE_COOKIES, max_age=600)
+    # Lax: both are sent on the top-level redirect back from Google.
+    response.set_cookie("oauth_state", state, **cookie)
+    if ticket:
+        response.set_cookie("oauth_ticket", ticket, **cookie)
     return response
 
 
@@ -355,9 +507,14 @@ async def google_callback(code: str, request: Request, state: str | None = None)
         )
     try:
         creds = exchange_code(code)
+        sub = None
+        try:
+            sub = tickets.verify(request.cookies.get("oauth_ticket") or "").get("sub")
+        except tickets.TicketError:
+            pass
         # Persist credentials keyed to the session cookie so they survive restarts.
         session_key = request.cookies.get("exam_sync_session") or secrets.token_urlsafe(24)
-        token_store.save_credentials(session_key, creds)
+        token_store.save_credentials(_user_key(sub) if sub else session_key, creds)
         response = RedirectResponse(f"{FRONTEND_URL}?google_connected=true")
         response.set_cookie(
             "exam_sync_session",
@@ -369,6 +526,7 @@ async def google_callback(code: str, request: Request, state: str | None = None)
             max_age=60 * 60 * 24 * 7,
         )
         response.delete_cookie("oauth_state")
+        response.delete_cookie("oauth_ticket")
         return response
     except HTTPException:
         raise
@@ -377,15 +535,15 @@ async def google_callback(code: str, request: Request, state: str | None = None)
 
 
 @app.post("/sync/google", response_model=SyncResult)
-async def sync_google(
+def sync_google(
     body: SyncRequest, request: Request, user: dict = Depends(require_user)
 ):
-    session_key = request.cookies.get("exam_sync_session")
-    creds = token_store.get_credentials(session_key)
+    creds = _google_credentials(user, request)
     if not creds:
         raise HTTPException(status_code=401, detail="Not authenticated with Google. Connect Google Calendar first.")
 
     warnings = _validate_exam_schedule(body.exams)
+    _validate_timezone(body.timezone)
     try:
         event_ids, removed = sync_exams_to_google(
             creds,
@@ -393,6 +551,7 @@ async def sync_google(
             body.reminder_minutes,
             body.timezone,
             stale_keys=body.stale_keys,
+            mode=body.reminder_mode,
         )
         message = f"Synced {len(event_ids)} exam event(s) to Google Calendar."
         if removed:
@@ -404,11 +563,34 @@ async def sync_google(
             warnings=warnings,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.getLogger("xamio").exception("Google sync failed")
+        text = str(e)
+        if "invalid_grant" in text or "Token has been expired or revoked" in text:
+            raise HTTPException(
+                status_code=401,
+                detail="Your Google connection has expired. Connect Google Calendar again.",
+            )
+        raise HTTPException(status_code=502, detail="Google Calendar didn't accept the sync. Try again in a minute.")
+
+
+def _user_key(sub: str) -> str:
+    return f"user:{sub}"
+
+
+def _google_credentials(user: dict, request: Request) -> dict | None:
+    """Google tokens for this user. Falls back to the legacy per-browser cookie
+    and, when found, re-files them under the user so the cookie stops mattering."""
+    sub = user.get("sub")
+    if sub:
+        creds = token_store.get_credentials(_user_key(sub))
+        if creds:
+            return creds
+    legacy = token_store.get_credentials(request.cookies.get("exam_sync_session"))
+    if legacy and sub:
+        token_store.save_credentials(_user_key(sub), legacy)
+    return legacy
 
 
 @app.get("/auth/google/status")
 def google_status(request: Request, user: dict = Depends(require_user)):
-    session_key = request.cookies.get("exam_sync_session")
-    connected = token_store.has_credentials(session_key)
-    return {"connected": connected}
+    return {"connected": _google_credentials(user, request) is not None}

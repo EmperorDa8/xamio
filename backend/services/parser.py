@@ -5,8 +5,44 @@ import re
 from datetime import datetime
 import pdfplumber
 from PIL import Image
-from models import ExamEntry, ParsedTimetable
+from models import ATTENDED_KINDS, ExamEntry, ParsedTimetable
 from services.datetime_utils import normalize_date, normalize_time, find_date_anchors
+
+
+VALID_KINDS = frozenset(
+    {"exam", "test", "coursework", "problem_set", "milestone", "meeting"}
+)
+
+# Substring -> kind, checked in order, so "final_exam" resolves before "final".
+# Only needed when the model ignores the enum and paraphrases instead.
+_KIND_SYNONYMS = {
+    "problem": "problem_set",
+    "pset": "problem_set",
+    "homework": "problem_set",
+    "lab": "problem_set",
+    "assignment": "coursework",
+    "essay": "coursework",
+    "report": "coursework",
+    "project": "coursework",
+    "submission": "coursework",
+    "portfolio": "coursework",
+    "thesis": "milestone",
+    "dissertation": "milestone",
+    "chapter": "milestone",
+    "ethics": "milestone",
+    "grant": "milestone",
+    "conference": "milestone",
+    "abstract": "milestone",
+    "milestone": "milestone",
+    "meeting": "meeting",
+    "viva": "meeting",
+    "defence": "meeting",
+    "defense": "meeting",
+    "presentation": "meeting",
+    "quiz": "test",
+    "test": "test",
+    "exam": "exam",
+}
 
 
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
@@ -101,8 +137,27 @@ def _call_gemini(prompt: str) -> str:
     return (response.text or "").strip()
 
 
-EXTRACTION_PROMPT = """You are an exam timetable parser for students. Timetables
-come in MANY layouts and from MANY countries. Adapt to whatever you are given.
+def _call_gemini_vision(image_bytes: bytes, mime: str, prompt: str) -> str:
+    """Read a timetable straight from a photo. Used when OCR is unavailable —
+    Render's Python runtime ships without the tesseract binary, so without this
+    every PNG/JPG upload failed in production."""
+    from google.genai import types
+
+    response = get_gemini_client().models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime), prompt],
+    )
+    return (response.text or "").strip()
+
+
+class OCRUnavailable(ValueError):
+    """Raised when an image needs OCR and this deployment cannot provide it."""
+
+
+EXTRACTION_PROMPT = """You are a deadline parser for students. You read whatever
+a student uploads — an exam timetable, a course syllabus, an assignment brief, a
+programme handbook — and pull out every dated thing they must not miss.
+Documents come in MANY layouts and from MANY countries. Adapt to what you are given.
 
 Common layouts (handle ALL of them):
 - GRID/MATRIX: rows are dates, columns are time slots from a header row; a cell
@@ -122,20 +177,61 @@ Date formats vary by country — interpret correctly, then ALWAYS output ISO:
 
 {courses_section}
 
-Return a single JSON object: {{"exams": [ ... ]}}
-Each exam object must have exactly these fields:
-- course_code: string, exactly as written (e.g. "CIT216")
-- course_name: string or null
+CLASSIFY every item you find. This matters more than anything else you do here:
+the reminder schedule a student gets is chosen from this one field, and an essay
+reminded about like an exam is useless.
+- "exam"        a sit-down assessment the student ATTENDS at a place and time.
+                Words: exam, examination, final, paper, sitting.
+- "test"        a shorter in-class test or quiz they also attend.
+                Words: test, quiz, class test, mid-term, midterm.
+- "coursework"  something they SUBMIT by a deadline. This is the common case in
+                a syllabus or assignment brief.
+                Words: assignment, essay, report, project, coursework, portfolio,
+                submission, hand-in, due, deliverable, dissertation chapter.
+- "problem_set" recurring low-stakes homework, usually weekly and numbered.
+                Words: problem set, pset, homework, weekly exercise, lab sheet,
+                tutorial questions.
+- "milestone"   a postgraduate or research checkpoint.
+                Words: thesis, dissertation deadline, chapter draft, ethics
+                approval, IRB, upgrade/confirmation review, abstract deadline,
+                camera-ready, grant, funding call, conference submission.
+- "meeting"     something scheduled with a person.
+                Words: supervisor meeting, viva, defence, defense, tutorial,
+                presentation, oral, interview.
+When genuinely ambiguous, prefer "coursework" if it is submitted and "exam" if it
+is attended. Never guess a kind you have no evidence for.
+
+Return a single JSON object: {{"items": [ ... ]}}
+Each item object must have exactly these fields:
+- kind: one of "exam", "test", "coursework", "problem_set", "milestone", "meeting"
+- course_code: string, exactly as written (e.g. "CIT216"). If the document has no
+  course codes (a handbook or a research calendar), use the clearest available
+  short label instead, e.g. "THESIS" or "ETHICS".
+- course_name: string or null — the name of the course/module
+- title: string or null — the name of THIS item, when it has one distinct from
+  the course ("Essay 2: Coastal erosion", "Problem Set 4", "Chapter 3 draft").
+  Null for an exam, which needs no title beyond its course.
 - date: string in YYYY-MM-DD format (ISO 8601), e.g. "2026-06-01"
-- time: string in HH:MM 24h format (8:30am -> "08:30", 11am -> "11:00", 2pm -> "14:00")
-- duration_minutes: integer or null, default 120 if not specified
-- venue: string or null
+- time: string in HH:MM 24h format (8:30am -> "08:30", 11am -> "11:00", 2pm -> "14:00").
+  If a submission deadline gives no time, use "23:59". If an attended item gives
+  no time, use null rather than inventing one.
+- duration_minutes: integer or null. Only for attended items (exam/test/meeting);
+  default 120 for an exam if unspecified. Null for anything submitted.
+- venue: string or null. Only for attended items.
+- weight_pct: number or null — percentage of the final grade, if stated ("worth
+  30%" -> 30).
+- est_effort_hours: number or null — ONLY if the document states expected effort
+  ("approx. 20 hours", "2,000 words" -> null, do not convert). Do not estimate.
+- submission_url: string or null — a stated hand-in link, if any.
 
 Rules:
-- Output EVERY exam you can identify; never invent codes or dates.
+- Output EVERY dated item you can identify; never invent codes, dates or titles.
+- A single document may contain several kinds at once. Do not force them all to
+  one kind.
+- Leave a field null rather than guessing it.
 - Only output the JSON object, no explanation.
 
-Timetable text:
+Document text:
 {text}
 """
 
@@ -144,12 +240,12 @@ def build_prompt(raw_text: str, registered: list[str]) -> str:
     if registered:
         codes = ", ".join(registered)
         courses_section = (
-            "ONLY return exams for these registered courses (match the course code "
+            "ONLY return items for these registered courses (match the course code "
             "ignoring spaces, punctuation and case). Ignore every other course:\n"
             f"{codes}"
         )
     else:
-        courses_section = "Extract EVERY exam in the timetable. Do not omit any course."
+        courses_section = "Extract EVERY dated item in the document. Do not omit any course."
     return EXTRACTION_PROMPT.format(text=raw_text, courses_section=courses_section)
 
 
@@ -205,14 +301,16 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def extract_text_from_image(file_bytes: bytes) -> str:
     try:
+        image = Image.open(io.BytesIO(file_bytes))
+        image.load()
+    except Exception:
+        raise ValueError("That image couldn't be opened. Try a PNG or JPG screenshot of the timetable.")
+    try:
         import pytesseract
-    except ImportError:
-        raise ValueError(
-            "Image OCR is not available in this deployment. "
-            "Please upload a PDF, Excel, CSV, or text file instead."
-        )
-    image = Image.open(io.BytesIO(file_bytes))
-    return pytesseract.image_to_string(image)
+
+        return pytesseract.image_to_string(image)
+    except Exception as e:  # ImportError, TesseractNotFoundError, ...
+        raise OCRUnavailable(str(e))
 
 
 def extract_text_from_excel(file_bytes: bytes) -> str:
@@ -303,9 +401,17 @@ def parse_json_object(content: str) -> dict:
         parsed = json.loads(content[start : end + 1])
 
     if isinstance(parsed, list):
-        return {"exams": parsed, "registered_courses": [], "unmatched_courses": []}
+        return {"items": parsed, "registered_courses": [], "unmatched_courses": []}
     if not isinstance(parsed, dict):
         raise ValueError("Model returned JSON, but not an object.")
+    # The prompt asks for "items", but models routinely echo an older key or
+    # name the array after the document ("exams", "assignments", "deadlines").
+    # Normalise rather than losing a good parse to a key name.
+    if "items" not in parsed:
+        for alias in ("exams", "assignments", "deadlines", "entries"):
+            if isinstance(parsed.get(alias), list):
+                parsed["items"] = parsed[alias]
+                break
     return parsed
 
 
@@ -315,12 +421,26 @@ def _norm_code(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (value or "").lower())
 
 
+def registered_code(line: str) -> str | None:
+    """The normalised course code in a registered-course line, if it has one.
+
+    "CSC 201 - Data Structures" -> "csc201". Lines that are only a course name
+    return None and are matched by name instead.
+    """
+    m = _CODE_RE.search(line or "")
+    return _norm_code(f"{m.group(1)}{m.group(2)}") if m else None
+
+
 def match_exams(
     exams: list[ExamEntry], registered: list[str]
 ) -> tuple[list[ExamEntry], list[str]]:
     """Filter exams to those matching a registered course, and report which
-    registered courses had no exam. Matching is done on normalized course codes
-    and names, tolerant of spacing/punctuation/case."""
+    registered courses had no exam.
+
+    Codes must match EXACTLY once spacing, punctuation and case are removed.
+    Substring matching used to let "ENG101" pull in "SENG101", handing a
+    student somebody else's exam. A line with no code in it ("Data
+    Structures") is matched against the course name instead."""
     if not registered:
         return exams, []
 
@@ -331,10 +451,13 @@ def match_exams(
         code = _norm_code(exam.course_code)
         name = _norm_code(exam.course_name or "")
         for reg in registered:
-            r = _norm_code(reg)
-            if not r:
-                continue
-            if r == code or r in code or code in r or (name and r in name):
+            reg_code = registered_code(reg)
+            if reg_code:
+                hit = reg_code == code
+            else:
+                r = _norm_code(reg)
+                hit = len(r) >= 4 and bool(name) and r in name
+            if hit:
                 matched.append(exam)
                 matched_regs.add(reg)
                 break
@@ -396,7 +519,8 @@ def manual_extract(raw_text: str, registered: list[str]) -> list[ExamEntry]:
     )
 
     times = _detect_time_columns(text)
-    reg_norm = {_norm_code(r) for r in registered if _norm_code(r)}
+    reg_norm = {registered_code(r) or _norm_code(r) for r in registered}
+    reg_norm.discard("")
 
     exams: list[ExamEntry] = []
     found: set[str] = set()
@@ -460,7 +584,8 @@ def focus_timetable_text(raw_text: str, registered: list[str], max_chars: int = 
     if not registered:
         return raw_text
 
-    reg = {_norm_code(r) for r in registered if _norm_code(r)}
+    reg = {registered_code(r) or _norm_code(r) for r in registered}
+    reg.discard("")
     kept: list[str] = []
     for line in raw_text.splitlines():
         keep = bool(_TIME_TOKEN_RE.search(line) or _DATE_RE.search(line))
@@ -478,21 +603,55 @@ def focus_timetable_text(raw_text: str, registered: list[str], max_chars: int = 
     return focused[:max_chars]
 
 
-def _exams_from_content(content: str) -> list[ExamEntry]:
+def _coerce_kind(value) -> str:
+    """Map whatever the model called the kind onto one we support.
+
+    Models paraphrase ("assignment", "Homework", "final exam"), and an
+    unrecognised kind must not sink the row — it falls back to "exam", which is
+    what every row meant before kinds existed.
+    """
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw in VALID_KINDS:
+        return raw
+    for needle, kind in _KIND_SYNONYMS.items():
+        if needle in raw:
+            return kind
+    return "exam"
+
+
+def _items_from_content(content: str) -> list[ExamEntry]:
     data = parse_json_object(content)
-    exams = []
-    for entry in data.get("exams", []):
+    items = []
+    for entry in data.get("items", []):
         if not isinstance(entry, dict):
             continue
         # Models sometimes emit placeholder/empty rows (e.g. {"": ""}); skip any
-        # row missing the required fields rather than failing the whole parse.
-        if not entry.get("course_code") or not entry.get("date") or not entry.get("time"):
+        # row missing the fields we cannot reconstruct, rather than failing the
+        # whole parse.
+        if not entry.get("course_code") or not entry.get("date"):
             continue
+
+        entry = dict(entry)
+        entry["kind"] = _coerce_kind(entry.get("kind"))
+
+        # A submission deadline stated as a bare date is normal ("due 14 March").
+        # End-of-day is the near-universal convention for one, so fill it in
+        # instead of discarding a perfectly good deadline. An attended item with
+        # no time is genuinely unusable, so it is still dropped.
+        if not entry.get("time"):
+            if entry["kind"] in ATTENDED_KINDS:
+                continue
+            entry["time"] = "23:59"
+
+        # Duration only means anything for something you sit in a room for.
+        if entry["kind"] not in ATTENDED_KINDS:
+            entry["duration_minutes"] = None
+
         try:
-            exams.append(ExamEntry(**entry))
+            items.append(ExamEntry(**entry))
         except Exception:
             continue
-    return exams
+    return items
 
 
 def parse_with_claude(raw_text: str, registered: list[str]) -> tuple[list[ExamEntry], str]:
@@ -514,7 +673,7 @@ def parse_with_claude(raw_text: str, registered: list[str]) -> tuple[list[ExamEn
             continue
         last_model = model
         try:
-            exams = _exams_from_content(content)
+            exams = _items_from_content(content)
         except Exception as e:
             errors.append(f"{name} (bad JSON): {e}")
             continue
@@ -587,6 +746,15 @@ def verify_and_correct_dates(
     if not exams:
         return exams, warnings
 
+    # The index anchors a course code to the date block it sits under, which is
+    # the structure of an exam timetable grid. A syllabus lists many deadlines
+    # for one course, so that course legitimately appears under several dates —
+    # verifying those would flag every correct row as "found under multiple
+    # dates". Only sat assessments go through the verifier.
+    checkable = [e for e in exams if e.is_attended]
+    if not checkable:
+        return exams, warnings
+
     index = build_timetable_date_index(raw_text)
 
     # The verifier only helps for grid/row layouts where codes sit under a date
@@ -594,11 +762,11 @@ def verify_and_correct_dates(
     # codes — if it covers too few of the extracted exams we skip verification
     # entirely rather than drown the user in false "unverified" flags. The AI
     # result still stands; we just don't second-guess it.
-    covered = sum(1 for e in exams if _norm_code(e.course_code) in index)
-    if not index or covered / len(exams) < 0.5:
+    covered = sum(1 for e in checkable if _norm_code(e.course_code) in index)
+    if not index or covered / len(checkable) < 0.5:
         return exams, warnings
 
-    for exam in exams:
+    for exam in checkable:
         code = _norm_code(exam.course_code)
         tt_dates = index.get(code)
 
@@ -638,31 +806,44 @@ def verify_and_correct_dates(
 
 
 def check_duplicate_dates(exams: list[ExamEntry]) -> list[str]:
-    """Flag any courses that landed on the same date. Each course should sit on
-    its own exam day — two codes sharing a date usually means the extractor
-    mis-anchored one of them, so mark both for review instead of letting a
-    wrong date reach the calendar silently."""
+    """Flag sittings that overlap in time on the same day.
+
+    A morning paper and an afternoon paper on one day is normal at large
+    universities, so sharing a DATE is not flagged — warning about it marked
+    correct schedules as unverified and taught students to ignore the warning.
+    Two sittings whose times actually overlap usually means the extractor
+    mis-anchored one of them, so both are marked for review.
+
+    Only sat assessments are checked; deadlines occupy no time.
+    """
+    from datetime import timedelta
+    from services.datetime_utils import parse_exam_datetime
+
     warnings: list[str] = []
-    by_date: dict[str, list[ExamEntry]] = {}
+    by_date: dict[str, list[tuple[ExamEntry, datetime, datetime]]] = {}
     for exam in exams:
-        if exam.date:
-            by_date.setdefault(exam.date, []).append(exam)
+        if not (exam.date and exam.is_attended):
+            continue
+        start = parse_exam_datetime(exam.date, exam.time)
+        if start is None:
+            continue
+        end = start + timedelta(minutes=exam.duration_minutes or 120)
+        by_date.setdefault(exam.date, []).append((exam, start, end))
 
     for date, group in by_date.items():
-        if len(group) < 2:
-            continue
-        codes = ", ".join(e.course_code for e in group)
-        warnings.append(
-            f"{codes} all fall on {date} — confirm each date; courses usually "
-            "sit on separate exam days."
-        )
-        for exam in group:
-            exam.date_verified = False
-            note = f"Shares {date} with: " + ", ".join(
-                e.course_code for e in group if e is not exam
-            )
-            exam.date_note = f"{exam.date_note} {note}".strip() if exam.date_note else note
-
+        group.sort(key=lambda g: g[1])
+        for i, (a, _, a_end) in enumerate(group):
+            for b, b_start, _ in group[i + 1:]:
+                if b_start >= a_end:
+                    break
+                for exam, other in ((a, b), (b, a)):
+                    exam.date_verified = False
+                    note = f"Overlaps {other.course_code} on {date}."
+                    exam.date_note = f"{exam.date_note} {note}".strip() if exam.date_note else note
+                warnings.append(
+                    f"{a.course_code} and {b.course_code} overlap on {date} "
+                    f"({a.time} and {b.time}) — check one of them isn't on the wrong day."
+                )
     return warnings
 
 
@@ -679,6 +860,43 @@ def normalize_entries(exams: list[ExamEntry]) -> list[ExamEntry]:
     return exams
 
 
+_IMAGE_MIME = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "webp": "image/webp", "bmp": "image/bmp", "tiff": "image/tiff",
+}
+
+
+def _parse_image_with_vision(
+    filename: str, ext: str, file_bytes: bytes, registered: list[str]
+) -> ParsedTimetable:
+    """Photo/screenshot path for deployments without OCR."""
+    if not os.getenv("GEMINI_API_KEY"):
+        raise ValueError(
+            "Photos of timetables can't be read right now. Please upload the PDF, "
+            "spreadsheet or Word version, or paste the timetable into a .txt file."
+        )
+    prompt = build_prompt("(The timetable is the attached image.)", registered)
+    try:
+        content = _call_gemini_vision(file_bytes, _IMAGE_MIME.get(ext, "image/png"), prompt)
+        exams = normalize_entries(_items_from_content(content))
+    except Exception as e:
+        print(f"[parse] vision parse failed for {filename}: {e}")
+        raise ValueError(
+            "We couldn't read that photo. Try a sharper, straight-on picture, or "
+            "upload the PDF or spreadsheet version."
+        )
+    matched, unmatched = match_exams(exams, registered)
+    print(f"[parse] {filename} | model={GEMINI_MODEL}-vision | matched {len(matched)}/{len(registered)}")
+    return ParsedTimetable(
+        exams=matched,
+        registered_courses=registered,
+        unmatched_courses=unmatched,
+        raw_text=None,
+        model_used=f"{GEMINI_MODEL} (vision)",
+        date_warnings=["Read from a photo — double-check every date and time before syncing."] if matched else [],
+    )
+
+
 def parse_timetable(
     filename: str,
     file_bytes: bytes,
@@ -686,7 +904,12 @@ def parse_timetable(
     registered_courses_filename: str | None = None,
     registered_courses_bytes: bytes | None = None,
 ) -> ParsedTimetable:
-    raw_text = extract_raw_text(filename, file_bytes)
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    try:
+        raw_text = extract_raw_text(filename, file_bytes)
+        vision_only = False
+    except OCRUnavailable:
+        raw_text, vision_only = "", True
     course_text_parts = [registered_courses_text.strip()] if registered_courses_text.strip() else []
     if registered_courses_filename and registered_courses_bytes:
         course_text_parts.append(extract_raw_text(registered_courses_filename, registered_courses_bytes))
@@ -695,6 +918,9 @@ def parse_timetable(
 
     exams: list[ExamEntry] = []
     model_used = None
+
+    if vision_only:
+        return _parse_image_with_vision(filename, ext, file_bytes, registered)
 
     # Fast path: the instant deterministic extractor. If it cleanly resolves
     # EVERY registered course (with a date and time), skip the AI entirely.
@@ -727,21 +953,25 @@ def parse_timetable(
     # keys, rate limits, model unavailable), say so clearly instead of returning
     # an empty timetable the user can't diagnose.
     if not exams and ai_error:
-        lowered = ai_error.lower()
-        if any(s in lowered for s in ("api key", "authentication", "401", "invalid_argument", "unauthorized")):
+        # The detail (which provider, which key) is for the logs, not the
+        # student — they can't act on "check backend/.env".
+        print(f"[parse] no exams for {filename}: {ai_error}")
+        if registered:
             raise ValueError(
-                "AI service rejected the request — check that OPENROUTER_API_KEY and "
-                "GEMINI_API_KEY in backend/.env are valid (not the placeholder values). "
-                f"Details: {ai_error}"
+                "We couldn't find your courses in this file. Check the course codes "
+                "match the timetable (e.g. CSC 201), or try a PDF or spreadsheet export."
             )
-        raise ValueError(f"Could not extract any exams from this file. Details: {ai_error}")
+        raise ValueError(
+            "We couldn't read any exams from this file. Add your registered course "
+            "codes and try again — that also makes parsing faster."
+        )
 
     exams = normalize_entries(exams)
     matched, unmatched = match_exams(exams, registered)
 
     # Cross-check every extracted date against the uploaded timetable and correct
     # any the AI got wrong, so a bad date never silently reaches the calendar.
-    matched, date_warnings = verify_and_correct_dates(matched, raw_text)
+    matched, date_warnings = verify_and_correct_dates(matched, raw_text) if raw_text else (matched, [])
     date_warnings += check_duplicate_dates(matched)
 
     print(
