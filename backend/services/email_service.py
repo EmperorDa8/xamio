@@ -9,6 +9,7 @@ from email.message import EmailMessage
 from models import ExamEntry
 from services.ical_service import build_ics
 from services import reminder_messages
+from services import email_templates
 
 RESEND_ENDPOINT = "https://api.resend.com/emails"
 
@@ -54,12 +55,16 @@ def check_email_config() -> str | None:
     )
 
 
-def _send_via_resend(to: str, subject: str, text: str, ics_bytes: bytes | None) -> None:
+def _send_via_resend(
+    to: str, subject: str, text: str, ics_bytes: bytes | None, html: str | None = None
+) -> None:
     """Send over Resend's HTTPS API. Works on hosts (e.g. Render) that block
     outbound SMTP ports, since this rides on port 443."""
     api_key = os.getenv("RESEND_API_KEY")
     sender = resend_sender()
     payload = {"from": sender, "to": [to], "subject": subject, "text": text}
+    if html:
+        payload["html"] = html
     if ics_bytes:
         payload["attachments"] = [
             {"filename": "exams.ics", "content": base64.b64encode(ics_bytes).decode()}
@@ -94,7 +99,9 @@ def _send_via_resend(to: str, subject: str, text: str, ics_bytes: bytes | None) 
         raise RuntimeError(f"Resend API error {e.code}: {detail}")
 
 
-def _send_via_smtp(to: str, subject: str, text: str, ics_bytes: bytes | None) -> None:
+def _send_via_smtp(
+    to: str, subject: str, text: str, ics_bytes: bytes | None, html: str | None = None
+) -> None:
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "587"))
     user = os.getenv("SMTP_USER")
@@ -114,6 +121,10 @@ def _send_via_smtp(to: str, subject: str, text: str, ics_bytes: bytes | None) ->
     msg["From"] = sender
     msg["To"] = to
     msg.set_content(text)
+    if html:
+        # Text first, HTML second: clients show the last alternative they can
+        # render, so HTML wins where supported and text is the fallback.
+        msg.add_alternative(html, subtype="html")
     if ics_bytes:
         msg.add_attachment(ics_bytes, maintype="text", subtype="calendar", filename="exams.ics")
     with smtplib.SMTP(host, port) as server:
@@ -122,13 +133,19 @@ def _send_via_smtp(to: str, subject: str, text: str, ics_bytes: bytes | None) ->
         server.send_message(msg)
 
 
-def _send(to: str, subject: str, text: str, ics_bytes: bytes | None = None) -> None:
+def _send(
+    to: str,
+    subject: str,
+    text: str,
+    ics_bytes: bytes | None = None,
+    html: str | None = None,
+) -> None:
     """Prefer the Resend HTTP API when configured (works on Render and other
     hosts that block SMTP); otherwise fall back to direct SMTP for local dev."""
     if os.getenv("RESEND_API_KEY"):
-        _send_via_resend(to, subject, text, ics_bytes)
+        _send_via_resend(to, subject, text, ics_bytes, html)
     else:
-        _send_via_smtp(to, subject, text, ics_bytes)
+        _send_via_smtp(to, subject, text, ics_bytes, html)
 
 
 def _format_exam(exam: ExamEntry) -> str:
@@ -165,7 +182,8 @@ def send_summary_email(
         + "— Xamio"
     )
     ics = build_ics(exams, reminder_minutes, timezone, mode=mode)
-    _send(to, f"Your schedule — {len(exams)} {plural}", body, ics_bytes=ics)
+    html = email_templates.summary_html([e.model_dump() for e in ordered], noun)
+    _send(to, f"Your schedule — {len(exams)} {plural}", body, ics_bytes=ics, html=html)
 
 
 def send_digest_email(to: str, payload: dict) -> None:
@@ -176,7 +194,7 @@ def send_digest_email(to: str, payload: dict) -> None:
     slot is still here, just in one place.
     """
     subject, body = reminder_messages.build_digest(payload, to)
-    _send(to, subject, body)
+    _send(to, subject, body, html=email_templates.digest_html(payload, to))
 
 
 def send_reminder_email(to: str, exam: dict) -> None:
@@ -190,4 +208,4 @@ def send_reminder_email(to: str, exam: dict) -> None:
     falls back to a generic action line, so those still read sensibly.
     """
     subject, body = reminder_messages.build_reminder(exam, to)
-    _send(to, subject, body)
+    _send(to, subject, body, html=email_templates.reminder_html(exam, to))

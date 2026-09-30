@@ -89,8 +89,8 @@ def sent_mail(monkeypatch):
     """Capture every outbound email instead of sending it."""
     outbox = []
 
-    def fake_send(to, subject, text, ics_bytes=None):
-        outbox.append({"to": to, "subject": subject, "text": text, "ics": ics_bytes})
+    def fake_send(to, subject, text, ics_bytes=None, html=None):
+        outbox.append({"to": to, "subject": subject, "text": text, "ics": ics_bytes, "html": html})
 
     monkeypatch.setattr(email_service, "_send", fake_send)
     return outbox
