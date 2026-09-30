@@ -552,3 +552,32 @@ def test_google_sync_is_idempotent_and_cleans_up(client, monkeypatch):
 def test_google_sync_without_connection(client):
     r = client.post("/sync/google", json={"exams": [future(20)]}, headers=auth_header())
     assert r.status_code == 401
+
+
+# ─────────────────────────── abuse resistance ───────────────────────────
+
+def test_rate_limit_cannot_be_dodged_with_fake_client_addresses(client):
+    """One account rotating X-Forwarded-For must still be limited."""
+    codes = [
+        upload(client, "t.txt", samples.as_txt(), headers={**auth_header(), "X-Forwarded-For": f"203.0.113.{i}"}).status_code
+        for i in range(6)
+    ]
+    assert codes[:5] == [200] * 5 and codes[5] == 429, codes
+
+
+def test_rate_limit_is_per_user(client):
+    for sub in ("alice", "bob"):
+        codes = [upload(client, "t.txt", samples.as_txt(), headers=auth_header(sub=sub)).status_code for _ in range(5)]
+        assert codes == [200] * 5, (sub, codes)
+
+
+def test_email_refused_when_there_is_no_verified_address(client, sent_mail, monkeypatch):
+    """With auth unconfigured the API fails open; it must not become an open
+    relay that mails any address a request names."""
+    from services import auth
+
+    monkeypatch.setattr(auth, "SUPABASE_JWT_SECRET", None)
+    monkeypatch.setattr(auth, "SUPABASE_URL", None)
+    r = client.post("/alerts/email", json={"email": "victim@example.com", "exams": [future(20)]})
+    assert r.status_code == 503, r.text
+    assert sent_mail == [] and _queue() == []
