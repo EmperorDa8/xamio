@@ -148,3 +148,30 @@ def test_overlapping_sittings_are_flagged():
     warnings = parser.check_duplicate_dates(exams)
     assert len(warnings) == 1 and "overlap" in warnings[0]
     assert all(e.date_verified is False for e in exams)
+
+
+# ─── branded HTML emails ───
+
+from services import email_templates
+
+
+def test_reminder_html_escapes_parsed_text():
+    html = email_templates.reminder_html(
+        {"course_code": "CSC<b>", "title": "<script>x</script>", "kind": "coursework",
+         "stage": "start", "date": "2026-10-10", "time": "23:59", "lead_minutes": 2880}
+    )
+    assert "<script>x" not in html and "&lt;script&gt;" in html
+    assert "in 2 days" in html
+    # the example slot from the action copy is drawn as a fill-in chip
+    assert "Thu 09:00-10:00, desk - outline + intro" in html
+
+
+def test_digest_and_summary_html_list_every_item():
+    items = [
+        {"course_code": "MTH211", "kind": "exam", "date": "2026-10-12", "time": "09:00"},
+        {"course_code": "CSC201", "kind": "problem_set", "date": "2026-10-11", "time": "17:00"},
+    ]
+    digest = email_templates.digest_html({"items": items})
+    assert "2 things" in digest and "Start with CSC201" in digest
+    summary = email_templates.summary_html(items, "deadline")
+    assert "MTH211" in summary and "CSC201" in summary and "Sun 11 Oct" in summary

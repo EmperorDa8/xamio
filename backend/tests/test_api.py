@@ -258,6 +258,7 @@ def test_email_sends_summary_and_queues_reminders(client, sent_mail):
     assert len(sent_mail) == 1
     assert sent_mail[0]["to"] == "student@uni.edu"
     assert sent_mail[0]["ics"] and b"BEGIN:VCALENDAR" in sent_mail[0]["ics"]
+    assert "MTH211" in sent_mail[0]["html"] and sent_mail[0]["text"]
     assert all(row["status"] == "pending" for row in _queue())
 
 
