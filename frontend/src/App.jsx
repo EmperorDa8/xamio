@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import axios from "axios";
+import { supabase } from "./lib/supabase";
 import UploadZone from "./components/UploadZone";
 import ExamTable from "./components/ExamTable";
 import ReminderConfig from "./components/ReminderConfig";
@@ -10,6 +11,10 @@ import ChangeSummary from "./components/ChangeSummary";
 import SiteNav, { Brand, SiteFooter } from "./components/SiteNav";
 import { useAuth } from "./auth/AuthProvider";
 import { logEvent } from "./lib/analytics";
+
+// Loaded only when someone opens /admin, so regular users never download it.
+// Access itself is enforced by the admin_dashboard() RPC, not by this split.
+const AdminDashboard = lazy(() => import("./components/admin/AdminDashboard"));
 import {
   saveSchedule,
   loadLatestSchedule,
@@ -48,6 +53,26 @@ const PAGE_HEADS = [
 
 export default function App() {
   const { user, loading: authLoading, signOut } = useAuth();
+  const [path, setPath] = useState(() => window.location.pathname);
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  useEffect(() => {
+    const onPop = () => setPath(window.location.pathname);
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  // Only decides whether to SHOW the Admin link; the data is gated server-side.
+  useEffect(() => {
+    if (!user) return setIsAdmin(false);
+    supabase.rpc("am_i_admin").then(({ data }) => setIsAdmin(data === true), () => setIsAdmin(false));
+  }, [user]);
+
+  const goTo = (to) => {
+    window.history.pushState({}, "", to);
+    setPath(to);
+    window.scrollTo({ top: 0 });
+  };
   const [step, setStep] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -269,6 +294,14 @@ export default function App() {
   }
   if (!user) return <PublicSite />;
 
+  if (path.replace(/\/+$/, "") === "/admin") {
+    return (
+      <Suspense fallback={<div className="auth-wrap"><div className="auth-loading"><span className="x-pulse" /> Loading…</div></div>}>
+        <AdminDashboard onExit={() => goTo("/")} />
+      </Suspense>
+    );
+  }
+
   const head = PAGE_HEADS[step];
   const initial = (user.user_metadata?.full_name || user.email || "?").trim()[0];
 
@@ -291,6 +324,9 @@ export default function App() {
             )}
             {view === "wizard" && step > 0 && (
               <button className="x-nav-link" onClick={reset}>Start over</button>
+            )}
+            {isAdmin && (
+              <button className="x-nav-link" onClick={() => goTo("/admin")}>Admin</button>
             )}
             <span className="x-user">
               <span className="x-avatar" aria-hidden="true">{initial}</span>
