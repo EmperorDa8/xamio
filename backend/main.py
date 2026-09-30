@@ -41,7 +41,33 @@ from services.auth import require_user
 # Reject uploads larger than this to protect memory and AI token spend.
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
 
-limiter = Limiter(key_func=get_remote_address)
+def _rate_key(request: Request) -> str:
+    """Who a rate limit applies to.
+
+    The signed-in user when there is a token: uvicorn runs with proxy headers
+    trusted, so the client address is whatever X-Forwarded-For claims, and a
+    fresh fake address per request walked straight past the per-IP limit.
+    The token's `sub` is read unverified here — the limiter runs before auth —
+    which is fine: a forged token gets its own bucket and then a 401 from
+    require_user, so it never reaches the expensive work.
+
+    Without a token, fall back to Cloudflare's connecting-client header (set by
+    Render's edge), then the socket address.
+    """
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        try:
+            import jwt
+
+            sub = jwt.decode(auth[7:].strip(), options={"verify_signature": False}).get("sub")
+            if sub:
+                return f"user:{sub}"
+        except Exception:
+            pass
+    return request.headers.get("cf-connecting-ip") or get_remote_address(request)
+
+
+limiter = Limiter(key_func=_rate_key)
 
 # Parsing is CPU-bound pure Python (pdfplumber) plus slow AI calls. Letting
 # every upload run at once starves the rest of the API of the interpreter; a
@@ -257,10 +283,17 @@ def email_alerts(
 ):
     if not body.exams:
         raise HTTPException(status_code=400, detail="No exams to send.")
-    # With auth enforced, only send to the signed-in user's own address — this
+    # Only ever send to the signed-in user's own, verified address — this
     # endpoint must not double as a spam relay for arbitrary recipients.
+    # When auth isn't configured there is no verified address at all, so
+    # refuse rather than mail whatever the request names.
     token_email = (user.get("email") or "").strip().lower()
-    if token_email and body.email.strip().lower() != token_email:
+    if not token_email:
+        raise HTTPException(
+            status_code=503,
+            detail="Email alerts are unavailable right now. Download the .ics or connect Google Calendar instead.",
+        )
+    if body.email.strip().lower() != token_email:
         raise HTTPException(
             status_code=403,
             detail=f"Alerts can only be sent to your sign-in email ({token_email}).",
