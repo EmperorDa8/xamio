@@ -205,6 +205,25 @@ function Reminders({ r }) {
   );
 }
 
+const regionNames = (() => {
+  try {
+    return new Intl.DisplayNames(undefined, { type: "region" });
+  } catch {
+    return null;
+  }
+})();
+const flag = (cc) => (/^[A-Z]{2}$/.test(cc || "") ? String.fromCodePoint(...[...cc].map((c) => 0x1f1a5 + c.charCodeAt(0))) : "");
+const countryName = (cc) => {
+  if (!cc || cc === "Unknown") return "Unknown";
+  let name = cc;
+  try {
+    name = regionNames?.of(cc) || cc;
+  } catch {
+    // unknown code
+  }
+  return `${flag(cc)} ${name}`;
+};
+
 const KIND_LABEL = { exam: "Exams", test: "Tests", coursework: "Assignments", problem_set: "Homework", milestone: "Milestones", meeting: "Meetings" };
 
 function Bars({ data, empty, labels = {} }) {
@@ -232,6 +251,7 @@ export default function AdminDashboard({ onExit }) {
   const [data, setData] = useState(null);
   const [state, setState] = useState("loading"); // loading | ready | denied | error
   const [error, setError] = useState(null);
+  const [audience, setAudience] = useState(null);
   // Real names/emails, fetched only when asked for and kept in memory only.
   // Each fetch is logged server-side in xamio.admin_access_log.
   const [directory, setDirectory] = useState(null);
@@ -257,6 +277,10 @@ export default function AdminDashboard({ onExit }) {
   };
 
   const load = useCallback(async () => {
+    // Audience is a separate RPC; if it fails the rest of the dashboard still loads.
+    supabase.rpc("admin_audience", { days }).then(({ data: a, error: ae }) => {
+      if (!ae) setAudience(a);
+    });
     const { data: d, error: e } = await supabase.rpc("admin_dashboard", { days });
     if (e) {
       // P0002 = not an admin; 42501 = not signed in. Both render as "not found".
@@ -389,6 +413,35 @@ export default function AdminDashboard({ onExit }) {
               <Retention cohorts={data.retention || []} />
             </section>
 
+            {audience && (
+              <section className="ad-card">
+                <h2>Audience</h2>
+                <p className="ad-note">
+                  Each user counted once, from their latest visit in the last {audience.days} days.{" "}
+                  {audience.covered < audience.real_users &&
+                    `Based on ${audience.covered} of ${audience.real_users} users; visits from before this was added carry no location or device.`}
+                </p>
+                <div className="ad-grid4">
+                  <div>
+                    <h3>Country</h3>
+                    <Bars data={Object.fromEntries(Object.entries(audience.countries).map(([k, n]) => [countryName(k), n]))} empty="No data yet." />
+                  </div>
+                  <div>
+                    <h3>Operating system</h3>
+                    <Bars data={audience.os} empty="No data yet." />
+                  </div>
+                  <div>
+                    <h3>Device</h3>
+                    <Bars data={audience.devices} empty="No data yet." />
+                  </div>
+                  <div>
+                    <h3>Browser</h3>
+                    <Bars data={audience.browsers} empty="No data yet." />
+                  </div>
+                </div>
+              </section>
+            )}
+
             <div className="ad-grid2">
               <section className="ad-card">
                 <h2>What people upload</h2>
@@ -442,7 +495,7 @@ export default function AdminDashboard({ onExit }) {
                 <table className="ad-table">
                   <thead>
                     <tr>
-                      <th>User</th>{directory && <th>Email</th>}<th>Signed up</th><th>Last seen</th><th>Active days</th>
+                      <th>User</th>{directory && <th>Email</th>}<th>Country</th><th>Device</th><th>Signed up</th><th>Last seen</th><th>Active days</th>
                       <th>Uploads</th><th>Syncs</th><th>Schedules</th><th>Reminders queued</th>
                     </tr>
                   </thead>
@@ -465,6 +518,12 @@ export default function AdminDashboard({ onExit }) {
                             ) : "—"}
                           </td>
                         )}
+                        <td>{audience?.by_user?.[u.id] ? countryName(audience.by_user[u.id].country) : <span className="ad-zero">—</span>}</td>
+                        <td>
+                          {audience?.by_user?.[u.id]
+                            ? `${audience.by_user[u.id].os} · ${audience.by_user[u.id].device}`
+                            : <span className="ad-zero">—</span>}
+                        </td>
                         <td>{fmtDate(u.signed_up)}</td>
                         <td>{ago(u.last_seen)}</td>
                         <td>{u.active_days}</td>
@@ -476,7 +535,7 @@ export default function AdminDashboard({ onExit }) {
                       );
                     })}
                     {users.length === 0 && (
-                      <tr><td colSpan={directory ? 9 : 8} className="ad-empty">No users match “{query}”.</td></tr>
+                      <tr><td colSpan={directory ? 11 : 10} className="ad-empty">No users match “{query}”.</td></tr>
                     )}
                   </tbody>
                 </table>
