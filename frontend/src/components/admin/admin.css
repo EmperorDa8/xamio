@@ -31,6 +31,13 @@
 .ad-note { margin: 4px 0 16px; font-size: 13px; color: var(--ink-3); }
 .ad-card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
 .ad-empty { color: var(--ink-3); font-size: 14px; padding: 12px 0; }
+.ad-reveal { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.ad-search {
+  min-width: 0; width: 220px; max-width: 100%;
+  padding: 8px 12px; font: inherit; font-size: 13px; color: var(--ink);
+  background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+}
+.ad-search:focus { outline: 2px solid var(--ink-3); outline-offset: 1px; }
 
 /* funnel + generic bars: one series, one hue */
 .ad-funnel, .ad-bars { list-style: none; display: grid; gap: 10px; }
