@@ -232,6 +232,29 @@ export default function AdminDashboard({ onExit }) {
   const [data, setData] = useState(null);
   const [state, setState] = useState("loading"); // loading | ready | denied | error
   const [error, setError] = useState(null);
+  // Real names/emails, fetched only when asked for and kept in memory only.
+  // Each fetch is logged server-side in xamio.admin_access_log.
+  const [directory, setDirectory] = useState(null);
+  const [revealing, setRevealing] = useState(false);
+  const [revealError, setRevealError] = useState(null);
+  const [query, setQuery] = useState("");
+
+  const reveal = useCallback(async () => {
+    setRevealing(true);
+    setRevealError(null);
+    const { data: d, error: e } = await supabase.rpc("admin_user_directory");
+    setRevealing(false);
+    if (e) {
+      setRevealError(e.message);
+      return;
+    }
+    setDirectory(Object.fromEntries(d.map((p) => [p.id, p])));
+  }, []);
+
+  const hide = () => {
+    setDirectory(null);
+    setQuery("");
+  };
 
   const load = useCallback(async () => {
     const { data: d, error: e } = await supabase.rpc("admin_dashboard", { days });
@@ -259,6 +282,16 @@ export default function AdminDashboard({ onExit }) {
   const funnel = data?.funnel || [];
   const uploaded = funnel.find((f) => f.step === "Uploaded a timetable")?.n || 0;
   const daily = useMemo(() => data?.daily || [], [data]);
+  const users = useMemo(() => {
+    const all = data?.users || [];
+    const q = query.trim().toLowerCase();
+    if (!directory || !q) return all;
+    return all.filter((u) => {
+      const p = directory[u.id];
+      return p && `${p.name || ""} ${p.email || ""}`.toLowerCase().includes(q);
+    });
+  }, [data, directory, query]);
+  const whoLabel = (id, masked) => (directory && directory[id] ? directory[id].name || directory[id].email : masked);
 
   if (state === "denied") {
     return (
@@ -372,7 +405,7 @@ export default function AdminDashboard({ onExit }) {
                   {data.recent.map((e, i) => (
                     <li key={i} className={e.is_admin ? "admin" : ""}>
                       <span className={`ad-ev ev-${e.event}`}>{EVENT_LABEL[e.event] || e.event}</span>
-                      <span className="ad-who">{e.is_admin ? "you" : e.who}</span>
+                      <span className="ad-who">{e.is_admin ? "you" : whoLabel(e.user_id, e.who)}</span>
                       <time>{ago(e.at)}</time>
                     </li>
                   ))}
@@ -381,20 +414,57 @@ export default function AdminDashboard({ onExit }) {
             </div>
 
             <section className="ad-card">
-              <h2>Users</h2>
-              <p className="ad-note">Emails are masked. Newest first.</p>
+              <div className="ad-card-head">
+                <div>
+                  <h2>Users</h2>
+                  <p className="ad-note">
+                    {directory
+                      ? "Showing real names and emails. This view was logged."
+                      : "Emails are masked. Newest first."}
+                  </p>
+                </div>
+                <div className="ad-reveal">
+                  {directory && (
+                    <input type="search" className="ad-search" placeholder="Search name or email"
+                      aria-label="Search users by name or email" value={query} onChange={(e) => setQuery(e.target.value)} />
+                  )}
+                  {directory ? (
+                    <button className="btn btn-ghost" onClick={hide}>Hide details</button>
+                  ) : (
+                    <button className="btn btn-ghost" onClick={reveal} disabled={revealing}>
+                      {revealing ? "Loading…" : "Show names & emails"}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {revealError && <div className="alert error"><span className="glyph">!</span><span>Couldn't load user details: {revealError}</span></div>}
               <div className="ad-scroll">
                 <table className="ad-table">
                   <thead>
                     <tr>
-                      <th>User</th><th>Signed up</th><th>Last seen</th><th>Active days</th>
+                      <th>User</th>{directory && <th>Email</th>}<th>Signed up</th><th>Last seen</th><th>Active days</th>
                       <th>Uploads</th><th>Syncs</th><th>Schedules</th><th>Reminders queued</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {data.users.map((u, i) => (
-                      <tr key={i} className={u.is_admin ? "admin" : ""}>
-                        <td><span className="ad-mono">{u.label}</span>{u.is_admin && <span className="ad-you">you</span>}</td>
+                    {users.map((u) => {
+                      const p = directory?.[u.id];
+                      return (
+                      <tr key={u.id} className={u.is_admin ? "admin" : ""}>
+                        <td>
+                          {p ? <span>{p.name || <span className="ad-zero">No name</span>}</span> : <span className="ad-mono">{u.label}</span>}
+                          {u.is_admin && <span className="ad-you">you</span>}
+                        </td>
+                        {directory && (
+                          <td>
+                            {p ? (
+                              <>
+                                <a className="ad-mono" href={`mailto:${p.email}`}>{p.email}</a>
+                                {!p.email_verified && <span className="ad-zero"> · unverified</span>}
+                              </>
+                            ) : "—"}
+                          </td>
+                        )}
                         <td>{fmtDate(u.signed_up)}</td>
                         <td>{ago(u.last_seen)}</td>
                         <td>{u.active_days}</td>
@@ -403,7 +473,11 @@ export default function AdminDashboard({ onExit }) {
                         <td>{u.schedules || <span className="ad-zero">0</span>}</td>
                         <td>{u.reminders_pending || <span className="ad-zero">0</span>}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
+                    {users.length === 0 && (
+                      <tr><td colSpan={directory ? 9 : 8} className="ad-empty">No users match “{query}”.</td></tr>
+                    )}
                   </tbody>
                 </table>
               </div>
