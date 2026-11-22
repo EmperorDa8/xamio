@@ -133,3 +133,9 @@
   .ad-who { grid-column: 1 / -1; grid-row: 2; }
   .ad-live { display: none; }
 }
+
+/* audience: four small breakdowns side by side */
+.ad-grid4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 22px; }
+.ad-grid4 h3 { margin: 0 0 10px; font: 600 13px var(--display); color: var(--ink-2); }
+@media (max-width: 980px) { .ad-grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .ad-grid4 { grid-template-columns: minmax(0, 1fr); } }
